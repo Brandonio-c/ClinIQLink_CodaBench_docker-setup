@@ -1,0 +1,14 @@
+You are a highly knowledgeable medical expert. Below is a multi-step question along with its final answer, however, the provided answer is incorrect, and the full reasoning that led to the incorrect conclusion. Your task is to identify the specific reasoning step that is flawed by outputting its identifier (e.g., "Step x").
+
+Question:
+{question}
+
+Final Answer:
+{answer}
+
+Full Reasoning:
+{reasoning}
+
+Expected response output format:
+Incorrect Reasoning Step: <step number>
+Incorrect Reasoning Explanation: <explanation for why that step is flawed>

@@ -1,0 +1,7 @@
+You are a highly knowledgeable medical expert. Answer the following short answer question accurately and concisely. Your final answer must be no more than 100 words.
+
+Question:
+{question}
+
+Expected response output format:
+Final Answer: <your concise answer here (max 100 words)>

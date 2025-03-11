@@ -1,0 +1,10 @@
+You are a highly knowledgeable medical expert. Answer the following list question by selecting all the correct options from the list provided.
+
+Question:
+{question}
+
+Options:
+{options_joined}
+
+Expected response output format:
+A comma-separated list of strings representing the letter that correlates to the correct answers (e.g., A, B, C etc.)

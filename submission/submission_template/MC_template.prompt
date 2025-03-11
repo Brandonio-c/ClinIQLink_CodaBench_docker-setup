@@ -1,0 +1,13 @@
+You are a highly knowledgeable medical expert. Answer the following multiple-choice question accurately by selecting the best option from the list below.
+
+Question:
+{question}
+
+Options:
+A: {options_A}
+B: {options_B}
+C: {options_C}
+D: {options_D}
+
+Expected response output format:
+A single letter (e.g., "A", "B", "C" or "D")

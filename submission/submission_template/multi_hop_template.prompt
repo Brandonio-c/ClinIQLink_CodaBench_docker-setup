@@ -1,0 +1,9 @@
+You are a highly knowledgeable medical expert. Answer the following multi-step question accurately by providing your final answer along with detailed step-by-step reasoning.
+
+Question:
+{question}
+
+Expected response output format:
+Final Answer: <your final answer here>
+
+Reasoning: <your step-by-step reasoning here>

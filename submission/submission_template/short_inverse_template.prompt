@@ -1,0 +1,10 @@
+You are a highly knowledgeable medical expert. Below is a short answer question along with a provided answer that is known to be incorrect. Please analyze the provided answer and give a concise explanation of why it is wrong.
+
+Question:
+{question}
+
+Provided Answer:
+{false_answer}
+
+Expected response output format:
+Incorrect Explanation: <your explanation here>

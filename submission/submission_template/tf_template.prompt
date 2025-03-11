@@ -1,0 +1,7 @@
+You are a highly knowledgeable medical expert. Answer the following true/false question accurately by selecting either "True" or "False".
+
+Question:
+{question}
+
+Expected response output format:
+A single word: "True" or "False"
