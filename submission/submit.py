@@ -4,21 +4,46 @@ import random
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
-import nltk
+from nltk.tokenize import word_tokenize
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from nltk.translate.meteor_score import meteor_score
 from rouge_score import rouge_scorer
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from transformers.pipelines import TextGenerationPipeline
+
+import nltk
+
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    print("Downloading 'punkt' tokenizer...")
+    nltk.download('punkt', quiet=True)
+
 
 class ClinIQLinkSampleDatasetSubmit:
     def __init__(self):
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
-        self.qa_dir = os.getenv("CODABENCH_DATASET_DIR", os.path.join(self.base_dir, "..", "data/codabench_consolidated_dataset"))
+        self.dataset_dir = os.getenv("CODABENCH_DATASET_DIR", os.path.join(self.base_dir, "..", "data/codabench_consolidated_dataset"))
         self.template_dir = os.path.join(self.base_dir, "submission_template")
         # Load a pre-trained SentenceTransformer model for semantic similarity calculations.
         self.st_model = SentenceTransformer('all-MiniLM-L6-v2')
-        nltk.download('punkt')
+        # Ensure NLTK uses a local data directory
+        self.nltk_data_dir = os.path.join(self.base_dir, "nltk_data")
+        nltk.data.path.append(self.nltk_data_dir)
+
+        # Ensure both 'punkt' and 'punkt_tab' are downloaded
+        for resource in ['punkt', 'punkt_tab']:
+            try:
+                nltk.data.find(f'tokenizers/{resource}')
+                print(f"NLTK '{resource}' tokenizer found.", flush=True)
+            except LookupError:
+                print(f"NLTK '{resource}' tokenizer not found. Downloading to local directory...", flush=True)
+                nltk.download(resource, download_dir=self.nltk_data_dir)
+                nltk.data.path.append(self.nltk_data_dir)
+
+
+
         # Placeholder: load the participant's LLM model and inference pipeline.
         self.model = self.load_participant_model()
         self.pipeline = self.load_participant_pipeline()
@@ -46,8 +71,8 @@ class ClinIQLinkSampleDatasetSubmit:
             if os.path.isdir(entry_path) and "config.json" in os.listdir(entry_path):
                 print(f"Loading Hugging Face model from: {entry_path}", flush=True)
                 try:
-                    model = AutoModelForCausalLM.from_pretrained(entry_path)
-                    self.tokenizer = AutoTokenizer.from_pretrained(entry_path)
+                    model = AutoModelForCausalLM.from_pretrained(entry_path, trust_remote_code=True, use_safetensors=True)
+                    self.tokenizer = AutoTokenizer.from_pretrained(entry_path, trust_remote_code=True)
                     print("Participant's Hugging Face model loaded successfully.", flush=True)
                     return model
                 except Exception as e:
@@ -106,8 +131,8 @@ class ClinIQLinkSampleDatasetSubmit:
             if os.path.isdir(entry_path) and "config.json" in os.listdir(entry_path):
                 print(f"Loading Hugging Face model from: {entry_path}", flush=True)
                 try:
-                    self.tokenizer = AutoTokenizer.from_pretrained(entry_path)
-                    model = AutoModelForCausalLM.from_pretrained(entry_path)
+                    model = AutoModelForCausalLM.from_pretrained(entry_path, trust_remote_code=True, use_safetensors=True)
+                    self.tokenizer = AutoTokenizer.from_pretrained(entry_path, trust_remote_code=True)
                     print("Hugging Face model loaded successfully.", flush=True)
                     return pipeline("text-generation", model=model, tokenizer=self.tokenizer)
                 except Exception as e:
@@ -173,13 +198,13 @@ class ClinIQLinkSampleDatasetSubmit:
 
         # Define QA types and corresponding filenames
         qa_types = {
-            "multiple_choice": ("MC_QA_merged.json", 200),
-            "true_false": ("TF_QA_merged.json", 200),
-            "list": ("list_QA_merged.json", 200),
-            "multi_hop": ("multi_hop_QA_merged.json", 225),
-            "multi_hop_inverse": ("multi_hop_inverse_QA_merged.json", 225),
-            "short": ("short_QA_merged.json", 225),
-            "short_inverse": ("short_inverse_QA_merged.json", 225),
+            "multiple_choice": ("MC.json", 200),
+            "true_false": ("TF.json", 200),
+            "list": ("list.json", 200),
+            "short": ("short.json", 200),
+            "short_inverse": ("short_inverse.json", 200),
+            "multi_hop": ("multi_hop.json", 200),
+            "multi_hop_inverse": ("multi_hop_inverse.json", 200),
         }
 
         sampled_qa = {}  # Store sampled QA pairs by type
@@ -192,7 +217,9 @@ class ClinIQLinkSampleDatasetSubmit:
                     data = json.load(f)
 
                     # Ensure we do not exceed the available number of QA pairs
-                    sampled_data = random.sample(data, min(sample_size, len(data)))
+                    flat_data = [item for sublist in data for item in (sublist if isinstance(sublist, list) else [sublist])]
+                    sampled_data = random.sample(flat_data, min(sample_size, len(flat_data)))
+
 
                     sampled_qa[qa_type] = sampled_data
 
@@ -206,17 +233,21 @@ class ClinIQLinkSampleDatasetSubmit:
 
     def generate_prompt(self, template, qa, qa_type):
         """
-        Generates a prompt for the given QA pair using the specified template.
-
+        Generates a prompt for a single QA dictionary using the specified template.
+        
         Args:
-            template (str): The prompt template.
-            qa (dict): A dictionary containing question and options (if applicable).
-            qa_type (str): The type of question (e.g., "true_false", "multiple_choice", "list", etc.).
+            template (str): The prompt template string with placeholders.
+            qa (dict or list): A dictionary representing the QA pair, or a list of such dicts.
+            qa_type (str): The QA type (e.g., "true_false", "multiple_choice", "list", etc.).
 
         Returns:
-            str: A formatted prompt.
+            str: The formatted prompt or an error message.
         """
         try:
+            if not isinstance(qa, dict):
+                print(f"Error: QA is not a dictionary after unpacking. Type: {type(qa)}")
+                return "Invalid QA input."
+
             # Extract common fields
             question = qa.get("question", "Unknown Question")
             answer = qa.get("answer", "")
@@ -224,11 +255,15 @@ class ClinIQLinkSampleDatasetSubmit:
             reasoning = qa.get("reasoning", "")
             false_answer = qa.get("false_answer", "")
 
+            # Format based on QA type
             if qa_type == "true_false":
                 return template.format(question=question)
 
             elif qa_type == "multiple_choice":
-                # Ensure the placeholders match your MC template
+                # Normalize options if they are a list instead of dict
+                if isinstance(options, list):
+                    options = {label: opt for label, opt in zip("ABCD", options)}
+
                 return template.format(
                     question=question,
                     options_A=options.get("A", "Option A missing"),
@@ -238,38 +273,33 @@ class ClinIQLinkSampleDatasetSubmit:
                 )
 
             elif qa_type == "list":
-                # Convert list to a joined string for {options_joined}
                 options_joined = "\n".join(options) if isinstance(options, list) else str(options)
-                return template.format(
-                    question=question,
-                    options_joined=options_joined
-                )
+                return template.format(question=question, options_joined=options_joined)
 
             elif qa_type == "multi_hop":
                 return template.format(question=question)
 
             elif qa_type == "multi_hop_inverse":
-                return template.format(
-                    question=question,
-                    answer=answer,
-                    reasoning=reasoning
-                )
+                return template.format(question=question, answer=answer, reasoning=reasoning)
 
             elif qa_type == "short":
                 return template.format(question=question)
 
             elif qa_type == "short_inverse":
-                return template.format(
-                    question=question,
-                    false_answer=false_answer
-                )
+                return template.format(question=question, false_answer=false_answer)
 
             else:
-                print(f"Warning: Unknown QA type '{qa_type}'", flush=True)
-                return "Invalid QA type."
+                print(f"Warning: Unknown QA type '{qa_type}'")
+                return f"Unsupported QA type: {qa_type}"
+
+        except KeyError as ke:
+            print(f"KeyError during prompt generation: {ke}")
+            return f"Missing key in QA object: {ke}"
 
         except Exception as e:
-            print(f"Error generating prompt: {e}", flush=True)
+            print(f"Exception in generate_prompt: {e}")
+            print("QA Type:", qa_type)
+            print("QA Object Dump:", json.dumps(qa, indent=2))
             return "Error generating prompt."
 
 
@@ -316,20 +346,23 @@ class ClinIQLinkSampleDatasetSubmit:
     def evaluate_list(self, expected, prediction):
         """
         Evaluate List questions using the F1 score.
-        'expected' should be a list of strings and 'prediction' can be a comma-separated string or list.
+        'expected' should be a list of strings and 'prediction' can be a comma-separated string or a list.
         """
         try:
-            # Convert prediction to a list if it's a string
-            if isinstance(prediction, str):
-                pred_list = [item.strip().lower() for item in prediction.split(",")]
-            else:
-                pred_list = [item.strip().lower() for item in prediction]
+            # Sanitize prediction to always get a list of strings
+            if isinstance(prediction, list):
+                # Join list elements into a single comma-separated string, then split
+                prediction = ", ".join(str(p) for p in prediction)
+
+            pred_list = [item.strip().lower() for item in prediction.split(",")]
             exp_list = [item.strip().lower() for item in expected]
+
             _, _, f1 = self.compute_f1_score(exp_list, pred_list)
             return f1
         except Exception as e:
             print(f"Error evaluating List question: {e}", flush=True)
             return 0.0
+
 
 
     def compute_word_level_similarity(self, expected_text, prediction_text):
@@ -407,6 +440,12 @@ class ClinIQLinkSampleDatasetSubmit:
         0 points if below 0.4, and linear interpolation is used between.
         """
         try:
+            # Ensure inputs are strings (not lists)
+            if isinstance(expected, list):
+                expected = " ".join(expected)
+            if isinstance(prediction, list):
+                prediction = " ".join(prediction)
+
             if expected.strip().lower() == prediction.strip().lower():
                 return 1.0
 
@@ -438,8 +477,10 @@ class ClinIQLinkSampleDatasetSubmit:
         """
         try:
             smoothing_function = SmoothingFunction().method1
-            bleu = sentence_bleu([expected.split()], prediction.split(), smoothing_function=smoothing_function)
-            meteor = meteor_score([expected], prediction)
+            expected_tokens = nltk.word_tokenize(expected)
+            predicted_tokens = nltk.word_tokenize(prediction)
+            bleu = sentence_bleu([expected_tokens], predicted_tokens, smoothing_function=smoothing_function)
+            meteor = meteor_score([' '.join(expected_tokens)], ' '.join(predicted_tokens))
             scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
             rouge_scores = scorer.score(expected, prediction)
             rouge_avg = (rouge_scores['rouge1'].fmeasure + rouge_scores['rougeL'].fmeasure) / 2.0
@@ -447,7 +488,6 @@ class ClinIQLinkSampleDatasetSubmit:
         except Exception as e:
             print(f"Error evaluating open-ended metrics: {e}", flush=True)
             return {"bleu": 0.0, "meteor": 0.0, "rouge": 0.0}
-
 
 
     def participant_model(self, prompt):
@@ -462,13 +502,13 @@ class ClinIQLinkSampleDatasetSubmit:
 
         try:
             # If using a Hugging Face model
-            if isinstance(self.model, pipeline):
-                response = self.model(prompt, max_length=200, do_sample=True)[0]['generated_text']
+            if isinstance(self.pipeline, TextGenerationPipeline):
+                response = self.pipeline(prompt, max_length=1028, do_sample=True)[0]['generated_text']
             
             # If using a PyTorch model with a `generate` method
             elif hasattr(self.model, "generate"):
                 input_ids = self.tokenizer.encode(prompt, return_tensors="pt")
-                output_ids = self.model.generate(input_ids, max_length=200)
+                output_ids = self.model.generate(input_ids, max_length=1028)
                 response = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
             # If using a script-based model with a callable function
