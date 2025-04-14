@@ -57,7 +57,7 @@ class ClinIQLinkSampleDatasetSubmit:
         """
         print("Searching for participant's LLM model in 'model_submissions'...", flush=True)
         
-        model_submissions_dir = os.path.join(self.base_dir, "model_submissions")
+        model_submissions_dir = os.path.join(self.base_dir, "../model_submission")
         
         if not os.path.exists(model_submissions_dir):
             print(f"Error: 'model_submissions' folder not found at {model_submissions_dir}", flush=True)
