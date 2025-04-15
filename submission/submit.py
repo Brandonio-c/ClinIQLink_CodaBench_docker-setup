@@ -2,6 +2,7 @@ import json
 import os
 import random
 import numpy as np
+import argparse
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 from nltk.tokenize import word_tokenize
@@ -12,23 +13,48 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 from transformers.pipelines import TextGenerationPipeline
 
+
+# Explicitly set HuggingFace & Torch cache paths for consistency and safety inside container
+os.environ["HF_HOME"] = "/app/.cache/huggingface"
+os.environ["TRANSFORMERS_CACHE"] = "/app/.cache/transformers"
+os.environ["TORCH_HOME"] = "/app/.cache/torch"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 import nltk
 
+# Ensure NLTK uses the global path set via Docker ENV
+nltk.data.path.append(os.environ.get("NLTK_DATA", "/usr/local/nltk_data"))
+
+# Sanity check: ensure 'punkt' is found (optional, should already be present)
 try:
-    nltk.data.find('tokenizers/punkt')
+    nltk.data.find("tokenizers/punkt")
+    print("NLTK 'punkt' tokenizer available.", flush=True)
 except LookupError:
-    print("Downloading 'punkt' tokenizer...")
+    print("Warning: 'punkt' tokenizer not found. This should not happen in a prebuilt container.", flush=True)
     nltk.download('punkt', quiet=True)
+    print("Downloading 'punkt' tokenizer...")
 
 
 class ClinIQLinkSampleDatasetSubmit:
-    def __init__(self):
-        self.base_dir = os.path.dirname(os.path.abspath(__file__))
-        self.dataset_dir = os.getenv("CODABENCH_DATASET_DIR", os.path.join(self.base_dir, "..", "data/codabench_consolidated_dataset"))
+    def __init__(self, run_mode="container", max_length=1028, sample_sizes=None):
+        self.run_mode = run_mode.lower()
+        self.max_length = max_length
+        self.sample_sizes = sample_sizes or {}
+        # Base directories and setup depending on run mode
+        if run_mode == "container":
+            print("Running in container mode.", flush=True)
+            self.base_dir = "/app"
+            self.st_model = SentenceTransformer('/app/models/sentence-transformers_all-MiniLM-L6-v2', local_files_only=True)
+        else:
+            print("Running in local mode.", flush=True)
+            self.base_dir = os.path.dirname(os.path.abspath(__file__))
+            self.st_model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')  # HF cache used
+
+        # Dataset and template directory setup
+        self.dataset_dir = os.getenv("DATA_DIR", os.path.join(self.base_dir, "..", "data"))
         self.template_dir = os.path.join(self.base_dir, "submission_template")
-        # Load a pre-trained SentenceTransformer model for semantic similarity calculations.
-        self.st_model = SentenceTransformer('all-MiniLM-L6-v2')
-        # Ensure NLTK uses a local data directory
+
+        # NLTK local data directory
         self.nltk_data_dir = os.path.join(self.base_dir, "nltk_data")
         nltk.data.path.append(self.nltk_data_dir)
 
@@ -41,7 +67,6 @@ class ClinIQLinkSampleDatasetSubmit:
                 print(f"NLTK '{resource}' tokenizer not found. Downloading to local directory...", flush=True)
                 nltk.download(resource, download_dir=self.nltk_data_dir)
                 nltk.data.path.append(self.nltk_data_dir)
-
 
 
         # Placeholder: load the participant's LLM model and inference pipeline.
@@ -57,7 +82,14 @@ class ClinIQLinkSampleDatasetSubmit:
         """
         print("Searching for participant's LLM model in 'model_submissions'...", flush=True)
         
-        model_submissions_dir = os.path.join(self.base_dir, "../model_submission")
+        if self.run_mode == "local":
+            model_submissions_dir = os.path.join(self.base_dir, "../model_submission")
+        else:
+            model_dir_env = os.getenv("USE_INTERNAL_MODEL", "1").strip().lower()
+            if model_dir_env in ["1", "true", "yes"]:
+                model_submissions_dir = os.path.join(self.base_dir, "model_submission")
+            else:
+                model_submissions_dir = os.path.join(self.base_dir, "../model_submission")
         
         if not os.path.exists(model_submissions_dir):
             print(f"Error: 'model_submissions' folder not found at {model_submissions_dir}", flush=True)
@@ -118,7 +150,14 @@ class ClinIQLinkSampleDatasetSubmit:
         """
         print("Searching for participant's LLM pipeline in 'model_submissions'...", flush=True)
         
-        model_submissions_dir = os.path.join(self.base_dir, "model_submissions")
+        if self.run_mode == "local":
+            model_submissions_dir = os.path.join(self.base_dir, "../model_submission")
+        else:
+            model_dir_env = os.getenv("USE_INTERNAL_MODEL", "1").strip().lower()
+            if model_dir_env in ["1", "true", "yes"]:
+                model_submissions_dir = os.path.join(self.base_dir, "model_submission")
+            else:
+                model_submissions_dir = os.path.join(self.base_dir, "../model_submission")
         
         if not os.path.exists(model_submissions_dir):
             print(f"Error: 'model_submissions' folder not found at {model_submissions_dir}", flush=True)
@@ -198,14 +237,14 @@ class ClinIQLinkSampleDatasetSubmit:
 
         # Define QA types and corresponding filenames
         qa_types = {
-            "multiple_choice": ("MC.json", 200),
-            "true_false": ("TF.json", 200),
-            "list": ("list.json", 200),
-            "short": ("short.json", 200),
-            "short_inverse": ("short_inverse.json", 200),
-            "multi_hop": ("multi_hop.json", 200),
-            "multi_hop_inverse": ("multi_hop_inverse.json", 200),
-        }
+    "multiple_choice": ("MC.json", self.sample_sizes.get("num_mc", 200)),
+    "true_false": ("TF.json", self.sample_sizes.get("num_tf", 200)),
+    "list": ("list.json", self.sample_sizes.get("num_list", 200)),
+    "short": ("short.json", self.sample_sizes.get("num_short", 200)),
+    "short_inverse": ("short_inverse.json", self.sample_sizes.get("num_short_inv", 200)),
+    "multi_hop": ("multi_hop.json", self.sample_sizes.get("num_multi", 200)),
+    "multi_hop_inverse": ("multi_hop_inverse.json", self.sample_sizes.get("num_multi_inv", 200)),
+}
 
         sampled_qa = {}  # Store sampled QA pairs by type
 
@@ -490,6 +529,7 @@ class ClinIQLinkSampleDatasetSubmit:
             return {"bleu": 0.0, "meteor": 0.0, "rouge": 0.0}
 
 
+
     def participant_model(self, prompt):
         """
         Uses the participant's loaded model to generate a response based on the given prompt.
@@ -503,12 +543,12 @@ class ClinIQLinkSampleDatasetSubmit:
         try:
             # If using a Hugging Face model
             if isinstance(self.pipeline, TextGenerationPipeline):
-                response = self.pipeline(prompt, max_length=1028, do_sample=True)[0]['generated_text']
+                response = self.pipeline(prompt, max_length=self.max_length, do_sample=True)[0]['generated_text']
             
             # If using a PyTorch model with a `generate` method
             elif hasattr(self.model, "generate"):
                 input_ids = self.tokenizer.encode(prompt, return_tensors="pt")
-                output_ids = self.model.generate(input_ids, max_length=1028)
+                output_ids = self.model.generate(input_ids, max_length=self.max_length)
                 response = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
             # If using a script-based model with a callable function
@@ -825,7 +865,43 @@ class ClinIQLinkSampleDatasetSubmit:
         except Exception as e:
             print(f"Error running overall evaluations: {e}", flush=True)
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="ClinIQLink Evaluation Script")
+    parser.add_argument(
+        "--mode",
+        choices=["local", "container"],
+        default="container",
+        help="Run mode: 'local' for local dev, 'container' for inside Docker/Apptainer (default: container)"
+    )
+    parser.add_argument(
+        "--max_length",
+        type=int,
+        default=1028,
+        help="Maximum token length for generated responses (default: 1028)"
+    )
+
+    # Add arguments for each QA type's sample size
+    parser.add_argument("--num_tf", type=int, default=200, help="Number of True/False questions to evaluate")
+    parser.add_argument("--num_mc", type=int, default=200, help="Number of Multiple Choice questions to evaluate")
+    parser.add_argument("--num_list", type=int, default=200, help="Number of List questions to evaluate")
+    parser.add_argument("--num_short", type=int, default=200, help="Number of Short Answer questions to evaluate")
+    parser.add_argument("--num_short_inv", type=int, default=200, help="Number of Short Inverse questions to evaluate")
+    parser.add_argument("--num_multi", type=int, default=200, help="Number of Multi-hop questions to evaluate")
+    parser.add_argument("--num_multi_inv", type=int, default=200, help="Number of Multi-hop Inverse questions to evaluate")
+    
+    return parser.parse_args()
+
 
 if __name__ == "__main__":
-    evaluator = ClinIQLinkSampleDatasetSubmit()
+    args = parse_args()
+    sample_sizes = {
+        "num_tf": args.num_tf,
+        "num_mc": args.num_mc,
+        "num_list": args.num_list,
+        "num_short": args.num_short,
+        "num_short_inv": args.num_short_inv,
+        "num_multi": args.num_multi,
+        "num_multi_inv": args.num_multi_inv,
+    }
+    evaluator = ClinIQLinkSampleDatasetSubmit(run_mode=args.mode, max_length=args.max_length, sample_sizes=sample_sizes)
     evaluator.run_all_evaluations()
