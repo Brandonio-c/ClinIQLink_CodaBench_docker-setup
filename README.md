@@ -15,7 +15,8 @@ This repository provides the complete evaluation environment for participants in
 
 1. Request access to UMD HPC via: https://docs.google.com/forms/d/e/1FAIpQLSerRZnVHm-Trk9eYp6ebrJHQKTPvSBrI6nBsKPguE8voigrWw/viewform?usp=sharing
 2. Containerize your submission using the provided instructions below
-3. Once you have recieved a globus endpoint to upload to;
+3. Once you have recieved a globus endpoint to upload to:
+
    a. Upload your model’s codebase (excluding the model weights file / any large files) to the Globus endpoint within a folder named:
       - model_submission
    
@@ -30,7 +31,6 @@ ClinIQLink_CodaBench_docker-setup/
 ├── Dockerfile                      # Defines the evaluation environment used by CodaBench 
 ├── Singularity.def                 # Apptainer file to containerize the submission for UMD HPC
 ├── README.md                       # This file
-├── .gitignore
 ├── LICENSE
 │
 ├── data/                           # Evaluation datasets (mounted at runtime)
@@ -43,43 +43,41 @@ ClinIQLink_CodaBench_docker-setup/
 │   ├── multi_hop_inverse.json
 │   └── low_gp_relevence_qa_pairs/
 │
-├── model_submission/               # Participant-provided model directory
-│   └── llama-3_2-1B/               # Example HuggingFace-compatible model
-│       ├── config.json
-│       ├── tokenizer.json
-│       ├── model.safetensors
-│       └── other required files
+├── model_submission/                                 # Participant-provided model directory
+│   └── YOUR_MODEL_SUBMISSION_FODLER/                 # Example HuggingFace-compatible model
+│       ├── e.g. config.json
+│       ├── e.g. tokenizer.json
+│       ├── e.g. model.safetensors
+│       └── e.g. other required files
 │
 ├── submission/                     # Main evaluation logic
 │   ├── submit.py                   # The evaluation script automatically run during submission
 │   ├── requirements.txt            # Python dependencies for submit.py
-│   └── README.md                   # Instructions for participants
-│
-├── submission_template/           # Prompt templates used by the evaluation script
-│   ├── MC_template.prompt
-│   ├── tf_template.prompt
-│   ├── list_template.prompt
-│   ├── short_template.prompt
-│   ├── short_inverse_template.prompt
-│   ├── multi_hop_template.prompt
-│   ├── multi_hop_inverse_template.prompt
-│   └── README.md
-│
-└── nltk_data/                      # Auto-populated with NLTK tokenizers (e.g., punkt)
+│   ├── README.md                   # Instructions for participants
+│   └──submission_template/           # Prompt templates used by the evaluation script
+         ├── MC_template.prompt
+         ├── tf_template.prompt
+         ├── list_template.prompt
+         ├── short_template.prompt
+         ├── short_inverse_template.prompt
+         ├── multi_hop_template.prompt
+         ├── multi_hop_inverse_template.prompt
+         └── README.md
 ```
 
 ---
 
 ## Overview
 
-This project is designed to evaluate local language models on a set of clinically grounded QA pairs. Evaluation is performed using a unified script (`submit.py`) which supports:
+This submit.py script is designed to evaluate your model on the ClinIQLink dataset (closed source). The submit.py is the unified evaluation script which supports:
 
-- Multiple QA types: TF, MC, list, short, inverse, multi-hop
+- Multiple QA types: TF, MC, list, short, short_inverse, multi-hop, multi-hop_inverse (all 7 modalities)
 - Prompt injection via templates
 - Scoring via F1, semantic similarity, and traditional metrics (BLEU, ROUGE, METEOR)
 - HuggingFace, PyTorch, or Python script-based models
 
 You can test your model using the Docker setup or submit directly to CodaBench using the same structure.
+All submissions to UMD HPC must be containerized using Singularity apptainer. Instructions on how to containerize are below. 
 
 ---
 
@@ -90,23 +88,7 @@ You can download a sample dataset of QA pairs for local testing from the followi
 **Sample QA Dataset Repository**:  
 [https://github.com/Brandonio-c/ClinIQLink_Sample-dataset](https://github.com/Brandonio-c/ClinIQLink_Sample-dataset)
 
-Place the `.json` files (e.g., `MC.json`, `TF.json`, etc.) directly into the `data/` folder for local evaluation.
-
----
-
-## How to Submit
-
-1. **Place your model in** `model_submission/your_model_name/`
-   - Must be a HuggingFace model folder, `.pt/.pth` checkpoint, or Python model script.
-   - See: [`model_submission/README.md`](./model_submission/README.md)
-
-2. **Do not modify the folder structure.**
-   - The script expects your model to reside in `model_submission/`
-   - Dataset files will be mounted under `data/` and must not be renamed.
-
-3. **Use `submit.py` to run locally or in Docker.**
-   - This script handles model loading, prompt generation, and scoring.
-   - See: [`submission/README.md`](./submission/README.md)
+The `.json` files (e.g., `MC.json`, `TF.json`, etc.) are pre-loaded directly into the `data/` folder for local evaluation by participants.
 
 ---
 
@@ -122,7 +104,8 @@ Prompt templates for each QA type live in `submission_template/` and are loaded 
 ## Evaluation Datasets
 
 - The datasets used for evaluation are JSON files located in the `data/` folder.
-- Participants do not need to edit or submit this folder; it will be mounted automatically during evaluation on Codabench or SLURM.
+- Participants do not need to edit or submit this folder; it will be mounted automatically during evaluation on Codabench UMD HPC. 
+- The dataset is closed source and will not be released. This dataset is for testing purposes only and can only be utilised through the NIH. 
 - See: [`data/README.md`](./data/README.md)
 
 ---
@@ -135,7 +118,11 @@ After running `submit.py`, the final evaluation results will be saved to:
 /tmp/overall_evaluation_results.json
 ```
 
-You can mount this path in Docker or SLURM to retrieve the file.
+You can mount this path in Docker or SLURM to retrieve the file, or just open the folder with: 
+
+```bash
+open /tmp/
+```
 
 ---
 
