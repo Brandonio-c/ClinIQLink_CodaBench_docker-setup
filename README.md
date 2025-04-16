@@ -41,7 +41,6 @@ ClinIQLink_CodaBench_docker-setup/
 │   ├── short_inverse.json
 │   ├── multi_hop.json
 │   ├── multi_hop_inverse.json
-│   └── low_gp_relevence_qa_pairs/
 │
 ├── model_submission/                                 # Participant-provided model directory
 │   └── YOUR_MODEL_SUBMISSION_FODLER/                 # Example HuggingFace-compatible model
@@ -50,11 +49,11 @@ ClinIQLink_CodaBench_docker-setup/
 │       ├── e.g. model.safetensors
 │       └── e.g. other required files
 │
-├── submission/                     # Main evaluation logic
-│   ├── submit.py                   # The evaluation script automatically run during submission
-│   ├── requirements.txt            # Python dependencies for submit.py
-│   ├── README.md                   # Instructions for participants
-│   └──submission_template/           # Prompt templates used by the evaluation script
+├── submission/                    # Main evaluation logic
+   ├── submit.py                   # The evaluation script automatically run during submission
+   ├── requirements.txt            # Python dependencies for submit.py
+   ├── README.md                   # Instructions for participants
+   └──submission_template/         # Prompt templates used by the evaluation script
          ├── MC_template.prompt
          ├── tf_template.prompt
          ├── list_template.prompt
@@ -69,7 +68,7 @@ ClinIQLink_CodaBench_docker-setup/
 
 ## Overview
 
-This submit.py script is designed to evaluate your model on the ClinIQLink dataset (closed source). The submit.py is the unified evaluation script which supports:
+The submit.py script within the submission subfolder is designed to evaluate your model on the ClinIQLink dataset (closed source). The submit.py script is the unified evaluation script which supports:
 
 - Multiple QA types: TF, MC, list, short, short_inverse, multi-hop, multi-hop_inverse (all 7 modalities)
 - Prompt injection via templates
@@ -94,17 +93,17 @@ The `.json` files (e.g., `MC.json`, `TF.json`, etc.) are pre-loaded directly int
 
 ## Prompt Templates
 
-Prompt templates for each QA type live in `submission_template/` and are loaded automatically by `submit.py`. These templates include placeholders (e.g., `{question}`, `{options}`) that are filled dynamically.
+Prompt templates for each QA type are preloaded to the folder  `submission_template/` and are loaded automatically by `submit.py`. These templates include placeholders (e.g., `{question}`, `{options}`) that are filled dynamically.
 
 - These must **not be modified** by participants.
-- See: [`submission_template/README.md`](./submission_template/README.md)
+- See: [`submission/submission_template/README.md`](./submission/submission_template/README.md)
 
 ---
 
 ## Evaluation Datasets
 
 - The datasets used for evaluation are JSON files located in the `data/` folder.
-- Participants do not need to edit or submit this folder; it will be mounted automatically during evaluation on Codabench UMD HPC. 
+- Participants do not need to edit or submit this folder; it will be mounted automatically during evaluation on Codabench or UMD HPC. 
 - The dataset is closed source and will not be released. This dataset is for testing purposes only and can only be utilised through the NIH. 
 - See: [`data/README.md`](./data/README.md)
 
@@ -126,29 +125,20 @@ open /tmp/
 
 ---
 
-## Additional References
+## Submission Instructions (long)
 
-- [Model Submission Guide](./model_submission/README.md)
-- [Evaluation Script Guide](./submission/README.md)
-- [Prompt Template Guide](./submission_template/README.md)
-
----
-
-For any issues, please refer to the official challenge documentation or email: brandon.colelough@nih.gov.
-
-
-## Submission Instructions (long): Full Build and Deployment Guide
-
-This guide outlines the steps required to prepare, validate, package, and convert a model submission for the ClinIQLink evaluation environment. It is designed to be model-agnostic and portable to HPC platforms such as UMD's Zaratan cluster using Apptainer.
+This guide outlines the steps required to prepare, validate, package, and (if needed) convert a model submission for the ClinIQLink evaluation environment. It is designed to be model-agnostic and portable to HPC platforms such as UMD's Zaratan cluster using Apptainer.
 
 - Instructions are also contained within submission_instructions.md file 
 
 ---
 
-## Step 1: Prepare the Project Directory
+## Step 1: Clone and Prepare the Project Directory
 
-Clone the Github page:
-https://github.com/Brandonio-c/ClinIQLink_CodaBench_docker-setup
+Clone this Github page:
+   ```bash
+   Git clone https://github.com/Brandonio-c/ClinIQLink_CodaBench_docker-setup.git
+   ```
 
 With the following directory setup: 
 
@@ -167,8 +157,8 @@ ClinIQLink_CodaBench_docker-setup/
 ├── README.md
 ```
 
-> Place your model within the model_submissions subfolder. 
-> Make sure your model is one of the following:
+Place your model within the model_submissions subfolder. 
+Make sure your model is one of the following:
    - Hugging Face-compatible
    - PyTorch compatible
    - Python script-based models WITH the required logic in `submit.py` added to load and run inference on your model.
@@ -477,3 +467,14 @@ Follow the instructions here:
 Once approved, you’ll be emailed a **Globus link** to upload your containerized Apptainer `.sif` file as well as your models code. Upload the files/model through the Globus web interface or the Globus Connect Personal app.
 
 ---
+
+## Additional References
+
+- [Model Submission Guide](./model_submission/README.md)
+- [Model Submission Instructions](./submission_instructions.md)
+- [Evaluation Script Guide](./submission/README.md)
+- [Prompt Template Guide](./submission/submission_template/README.md)
+
+---
+
+For any issues, please refer to the official challenge documentation or email: brandon.colelough@nih.gov.
