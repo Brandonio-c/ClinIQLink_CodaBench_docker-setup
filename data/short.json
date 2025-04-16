@@ -1,0 +1,53 @@
+[
+    {
+        "answer": "Their articulation with ribs.",
+        "question": "What characterizes the twelve thoracic vertebrae?",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para26"
+        },
+        "type": "short_answer"
+    },
+    {
+        "answer": "Heads of adjacent ribs; specifically, one with the head of its own rib via the superior costal facet, and another with the head of the rib below via the inferior costal facet.",
+        "question": "What do the two demifacets on a typical thoracic vertebra's body articulate with?",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para27"
+        },
+        "type": "short_answer"
+    },
+    {
+        "answer": "Pubic symphysis, ischial tuberosities, and the sacrococcygeal region connected via the sacrotuberous ligament.",
+        "question": "What structures form the margin of the pelvic outlet?",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para28"
+        },
+        "type": "short_answer"
+    },
+    {
+        "answer": "Subcostal nerve (T12), Iliohypogastric nerve (L1), Femoral nerve (L2-L4).",
+        "question": "What nerves arise from lumbar segments?",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para29"
+        },
+        "type": "short_answer"
+    },
+    {
+        "answer": "Normal bone quality with deficient bone quantity.",
+        "question": "What characterizes osteoporosis?",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para30"
+        },
+        "type": "short_answer"
+    }
+
+]

@@ -1,0 +1,142 @@
+[
+    {
+        "answer": [
+            "Trapezius",
+            "Latissimus dorsi",
+            "Rhomboid minor",
+            "Rhomboid major",
+            "Levator scapulae"
+        ],
+        "options": [
+            "Trapezius",
+            "Latissimus dorsi",
+            "Rhomboid minor",
+            "Levator scapulae",
+            "Deltoids",
+            "Biceps brachii",
+            "Triceps brachii",
+            "Rhomboid major"
+        ],
+        "question": "What are all the names of superficial and deeper muscles located in the back?",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para01"
+        },
+        "type": "list"
+    },
+    {
+        "answer": [
+            "Right recurrent laryngeal nerve",
+            "Right subclavian artery",
+            "Trachea",
+            "Esophagus",
+            "Superior vena cava",
+            "Right main bronchus",
+            "Cardiac plexus",
+            "Pulmonary plexus",
+            "Esophageal plexus"
+            ],
+        "options": [
+            "Right recurrent laryngeal nerve",
+            "Right subclavian artery",
+            "Trachea",
+            "Esophagus",
+            "Superior vena cava",
+            "Right main bronchus",
+            "Cardiac plexus",
+            "Pulmonary plexus",
+            "Esophageal plexus",
+            "Diaphragm",
+            "Azygos vein",
+            "Brachiocephalic trunk",
+            "Posterior vagal trunk",
+            "Phrenic nerve",
+            "Left vagus nerve",
+            "Thoracic duct"
+        ],
+        "question": "What structures does the right vagus nerve pass near or give branches to?",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para02"
+        },
+        "type": "list"
+    },
+    {
+        "question": "What are all the arteries involved in providing blood supply to the duodenum?",
+        "answer": [
+            "Celiac trunk branches",
+            "Superior mesenteric artery branches"
+        ],
+        "options": [
+            "Celiac trunk branches",
+            "Renal arteries",
+            "Inferior mesenteric artery branches",
+            "Common iliac arteries",
+            "Superior mesenteric artery branches",
+            "Splenic artery",
+            "Gonadal arteries",
+            "Lumbar arteries"
+        ],
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para03"
+        },
+        "type": "list"
+    },
+    {
+        "answer": [
+            "Rectal plexus",
+            "Uterovaginal plexus",
+            "Prostatic plexus",
+            "Vesical plexus"
+        ],
+        "options": [
+            "Rectal plexus",
+            "Uterovaginal plexus",
+            "Prostatic plexus",
+            "Vesical plexus"
+        ],
+        "question": "What are the subsidiary plexuses of the inferior hypogastric plexus? ",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para04"
+        },
+        "type": "list"
+    },
+    {
+        "answer": [
+            "Superior gluteal nerve and vessel",
+            "Inferior gluteal nerves and vessels",
+            "Sciatic nerve",
+            "Posterior femoral cutaneous nerves",
+            "Pudendal nerve",
+            "Internal pudendal artery and vein",
+            "Nerve to quadratus femoris",
+            "Nerves to obturator internus muscle"
+        ],
+        "options": [
+            "Superior gluteal nerve and vessel",
+            "Inferior gluteal nerves and vessels",
+            "Sciatic nerve",
+            "Posterior femoral cutaneous nerves",
+            "Pudendal nerve",
+            "Internal pudendal artery and vein",
+            "Nerve to quadratus femoris",
+            "Piriformis muscle",
+            "Obturator nerve and vessels",
+            "Greater trochanter"
+        ],
+        "question": "What are all the structures passing through the greater sciatic foramen?",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para05"
+        },
+        "type": "list"
+    }
+
+]

@@ -1,6 +1,8 @@
 # Data Directory
 
 This folder is reserved for the ClinIQLink QA datasets used during evaluation.
+The json files within this folder are from the sample data provided by the ClinIQLink team available at github here: 
+https://github.com/Brandonio-c/ClinIQLink_Sample-dataset
 
 ## Overview
 

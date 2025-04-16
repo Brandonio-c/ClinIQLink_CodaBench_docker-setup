@@ -1,0 +1,82 @@
+[
+    {
+        "correct_answer": "B",
+        "options": {
+            "A": "Right gastric artery",
+            "B": "Splenic artery proper",
+            "C": "Left gastroepiploic artery",
+            "D": "Superior mesenteric artery"
+        },
+        "question": "What artery primarily supplies blood to the spleen?",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para06"
+        },
+        "type": "multiple_choice"
+    },
+    {
+        "correct_answer": "C",
+        "options": {
+            "A": "Referred numbness from the skin to internal organs.",
+            "B": "Pain perception remains localized to its true source regardless of neural pathways.",
+            "C": "Sensation from areas of low sensory output is misinterpreted as originating from areas of higher sensory output.",
+            "D": "Motor functions become involuntary in regions affected by referred sensations."
+        },
+        "question": "What happens when the signals from both the visceral and somatic sensory neurons converge at the same spinal cord level?",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para07"
+        },
+        "type": "multiple_choice"
+    },
+    {
+        "correct_answer": "A",
+        "options": {
+            "A": "Thoracic, Lumbar, Sacral, Pelvic",
+            "B": "Only Thoracic splanchnic nerves exist",
+            "C": "Just Lumbar and Sacral splanchnic nerves",
+            "D": "Both Cranial and Spinal splanchnic nerves"
+        },
+        "question": "What levels of the spinal column give their names to the sets of splanchnic nerves that travel on each side of the vertebral column?",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para08"
+        },
+        "type": "multiple_choice"
+    },
+    {
+        "correct_answer": "C",
+        "options": {
+            "A": "Levels L3-L5",
+            "B": "Levels T10-T12",
+            "C": "Levels S2-S4",
+            "D": "Levels C6-C8"
+        },
+        "question": "At what level of the spine do spinal nerves form the pudendal nerve?",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para09"
+        },
+        "type": "multiple_choice"
+    },
+    {
+        "correct_answer": "D",
+        "options": {
+            "A": "Spinal cord level S3 to S5",
+            "B": "Spinal cord level L2 to S2",
+            "C": "Spinal cord level S2 to S4",
+            "D": "Spinal cord level L1"
+        },
+        "question": "What level of the spinal nerves supplies the dermatome that primarily maps the anterior regions of the perineum?",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para10"
+        },
+        "type": "multiple_choice"
+    }
+]

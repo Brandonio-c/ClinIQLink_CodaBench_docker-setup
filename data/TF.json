@@ -1,0 +1,53 @@
+[
+    {
+        "answer": "False",
+        "question": "There are lymphatic vessels present in the visceral pleura.",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para31"
+        },
+        "type": "true_false"
+    },
+    {
+        "answer": "False",
+        "question": "Renal cell carcinomas originate from the distal tubules of the nephron.",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para32"
+        },
+        "type": "true_false"
+    },
+    {
+        "answer": "True",
+        "question": "The transversalis fascia is continuous with the fascia on the inferior surface of the diaphragm.",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para33"
+        },
+        "type": "true_false"
+    },
+    {
+        "answer": "True",
+        "question": "Pericardial effusion typically presents with rapidly accumulating excess fluid causing cardiac tamponade due to compression of the heart.",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para34"
+        },
+        "type": "true_false"
+    },
+    {
+        "answer": "True",
+        "question": "Semispinalis capitis originates from the transverse processes of TI to TVI and inserts onto the medial area between the superior and inferior nuchal lines of the occipital bone.",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para35"
+        },
+        "type": "true_false"
+    }
+
+]

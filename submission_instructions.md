@@ -7,7 +7,10 @@ This guide outlines the steps required to prepare, validate, package, and conver
 
 ## Step 1: Prepare the Project Directory
 
-Create a directory structure like the following:
+Clone the Github page:
+https://github.com/Brandonio-c/ClinIQLink_CodaBench_docker-setup
+
+With the following directory setup: 
 
 ```
 ClinIQLink_CodaBench_docker-setup/
@@ -20,10 +23,15 @@ ClinIQLink_CodaBench_docker-setup/
 ├── submission/
 │   └── submit.py               # Main submission script (provided)
 ├── Dockerfile                  # Dockerfile to containerize the submission
+├── Singularity.def             # Apptainer file to containerize the submission
 ├── README.md
 ```
 
-> Make sure your model is Hugging Face-compatible, or you provide the required logic in `submit.py` to load and run inference.
+> Place your model within the model_submissions subfolder. 
+> Make sure your model is one of the following:
+   - Hugging Face-compatible
+   - PyTorch compatible
+   - Python script-based models WITH the required logic in `submit.py` added to load and run inference on your model.
 
 ---
 
@@ -47,7 +55,95 @@ ClinIQLink_CodaBench_docker-setup/
 
 ## Step 3: Build a Docker Image for Linux x86_64 (Required)
 
-### 1. Build the docker image (ensuring it is amd64)
+There are three ways to build the containerized submission:
+
+## Option 1 – Build and Run Directly with Apptainer
+
+This method builds the container directly using the provided `Singularity.def` file.  
+> **Note:** Ensure you are building on (or emulating) a Linux x86_64 environment.  
+> • On Linux, you can run the command directly.  
+> • On macOS, use a Lima VM to emulate linux/amd64.  
+> • On Windows, use WSL2 with Ubuntu.
+
+1. **Ensure the `Singularity.def` file is in your project root.**
+
+2. **Build your container directly:**
+
+   ```bash
+   apptainer build cliniqlink_submission.sif Singularity.def
+   ```
+
+   This command produces a container image file named `cliniqlink_submission.sif` built for the host’s architecture. Ensure your host (or VM/WSL2) is configured as Linux x86_64.
+
+3. **Run the container locally:**
+
+   To execute the evaluation script inside the container, run:
+   
+   ```bash
+   apptainer exec cliniqlink_submission.sif python /app/submit.py --mode container --max_length 1028 --num_tf 1 --num_mc 1 --num_list 1 --num_short 1 --num_short_inv 1 --num_multi 1 --num_multi_inv 1
+   ```
+
+   Alternatively, if you prefer using the default run command specified in the `%runscript` section, simply run:
+   
+   ```bash
+   apptainer run cliniqlink_submission.sif
+   ```
+
+---
+
+## Option 2 – Build the Apptainer SIF Directly from the Dockerfile
+
+This method builds the Docker image directly using the Dockerfile, ensuring the image is for linux/amd64, then converts it directly to an Apptainer SIF without creating a tar archive.  
+> **Note:**  
+> • On Linux, run these commands directly.  
+> • On macOS, ensure you run Docker with the `--platform linux/amd64` flag or use Docker Desktop configured for amd64 builds.  
+> • On Windows, use Docker Desktop (with WSL2) and specify the platform.
+
+1. **Build the Docker image locally using the Dockerfile:**  
+   In your project directory (where your `Dockerfile` resides), run:
+
+   ```bash
+   docker build --platform linux/amd64 -t cliniqlink_submission_image:latest .
+   ```
+
+2. **Convert the Docker image from the local Docker daemon directly into an Apptainer SIF:**
+
+   ```bash
+   apptainer build cliniqlink_submission.sif docker-daemon://cliniqlink_submission_image:latest
+   ```
+
+   This command directly accesses the Docker image (built for linux/amd64) from your local Docker daemon and converts it into an Apptainer SIF file.
+
+---
+
+### Platform-Specific Notes
+
+- **macOS Users:**  
+  • For Option 1, if your macOS system is not Linux, use a Lima VM configured for x86_64. For example:
+  
+  ```bash
+  brew install lima qemu
+  limactl create --name=apptainer-x86_64 --arch=x86_64 template://apptainer
+  limactl start apptainer-x86_64
+  limactl shell apptainer-x86_64
+  ```
+  
+  Then run the Option 1 commands from inside the VM.  
+  
+  • For Option 2, ensure Docker Desktop is set to build images with the linux/amd64 platform (via the `--platform linux/amd64` flag).
+
+- **Windows Users (via WSL2):**  
+  • Use Docker Desktop with WSL2 integration and run the commands from a WSL2 shell (e.g., Ubuntu).  
+  • For Option 1, you can install Apptainer directly in Ubuntu on WSL2.  
+  • For Option 2, ensure Docker builds with the `--platform linux/amd64` flag as shown above.
+
+---
+
+
+## Option 3 – Build from Docker and Convert to Apptainer SIF (Using a Tar Archive)
+
+
+### I. Build the docker image (ensuring it is amd64)
 
 Docker on macOS (especially on Apple Silicon) defaults to ARM64 builds, which are incompatible with the target HPC environment. You must explicitly build for `linux/amd64`.
 
@@ -56,14 +152,14 @@ docker buildx create --use   # One-time setup if not already done
 docker buildx build --platform linux/amd64 -t cliniqlink_submission_image --load .
 ```
 
-### 2. save it as a `.tar` file:
+### II. save it as a `.tar` file:
    ```bash
    docker save cliniqlink_submission_image:latest -o cliniqlink_submission.tar
    ```
 
 ---
 
-## Step 4: Convert Docker Image to Apptainer SIF (Platform-Specific Options)
+## III: Convert Docker Image to Apptainer SIF (Platform-Specific Options)
 
 After you've built your Docker image in **Step 3**, you'll need to convert it into an Apptainer `.sif` file to run it on the ClinIQLink evaluation infrastructure (e.g., UMD's Zaratan HPC).
 
@@ -219,7 +315,7 @@ Your built file will be located under:
 
 ---
 
-## Step 5: Submit the Container to UMD Zaratan
+## Step 4: Submit the Container to UMD Zaratan
 
 ### 1. Request Submission Access
 

@@ -1,0 +1,62 @@
+[
+    {
+        "answer": "The human spine consists of 6 cervical, 11 thoracic, 4 lumbar, 5 sacral, and 3 coccygeal vertebrae.",
+        "false_answer": "The human spine consists of 6 cervical, 11 thoracic, 4 lumbar, 5 sacral, and 3 coccygeal vertebrae.",
+        "incorrect_explanation": "The given answer contains several inaccuracies compared to the actual composition described in the paragraph. Specifically, there are actually 7 cervical, 12 thoracic, 5 lumbar, and the rest correctly identified. Therefore, the correct answer should reflect these accurate counts.",
+        "question": "What types and numbers of vertebrae make up the human spine?",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para21"
+        },
+        "type": "short_inverse"
+    },
+    {
+        "answer": "The highest thoracic dermatome on the posterior back is primarily T2.",
+        "false_answer": "The highest thoracic dermatome on the posterior back is primarily T2.",
+        "incorrect_explanation": "The statement incorrectly places the primary coverage of the T2 dermatome on the posterior back instead of mentioning its extension into the upper limb and presence on the anterior chest wall, indicating confusion between anatomical locations described in the passage.",
+        "question": "What is the primary area covered by the dermatome associated with the second thoracic spinal nerve?",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para22"
+        },
+        "type": "short_inverse"
+    },
+    {
+        "answer": "Lumbar vertebrae are smaller compared to cervical and thoracic vertebrae.",
+        "false_answer": "Lumbar vertebrae being smaller than cervical and thoracic vertebrae.",
+        "incorrect_explanation": "Lumbar vertebrae are described as 'much larger than any other vertebrae in any other region.' Therefore, the statement claiming they are smaller is a contradiction of the given facts. The correct distinction lies in their significant size relative to vertebrae found elsewhere along the vertebral column",
+        "question": "What distinguishes lumbar vertebrae from cervical and thoracic vertebrae?",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para23"
+        },
+        "type": "short_inverse"
+    },
+    {
+        "answer": "The testicular artery passes through these two anatomical landmarks.",
+        "false_answer": "The testicular artery passes through both the deep and superficial inguinal rings.",
+        "incorrect_explanation": "While the statement seems accurate at first glance because it involves key components associated with male anatomy near the groin area, specifically mentioning passage through significant anatomical points, the actual contents passing through the deep and superficial inguinal rings involve more comprehensive elements. Specifically, the spermatic cord contains various structures, including arteries, nerves, and lymphatics, which indeed traverse these regions. Thus, stating merely that \"the testicular artery passes through these two anatomical landmarks\" simplifies what actually goes through them; rather, the entire spermatic cord does, encompassing multiple components including but not limited to the testicular artery. Therefore, the most straightforward correction would acknowledge this broader composition correctly moving past these areas, emphasizing the involvement of the whole spermatic cord instead of isolating one component within it.",
+        "question": "What structures pass through both the deep and superficial inguinal rings?",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para24"
+        },
+        "type": "short_inverse"
+    },
+    {
+        "answer": "The urethra penetrates vertically through the levator ani muscle when moving between these two areas.",
+        "false_answer": "The urethra penetrates vertically through the levator ani muscle.",
+        "incorrect_explanation": "The urethra actually penetrates through a circular hiatus in the perineal membrane, not the levator ani muscle, as it moves from the pelvic cavity to the perineum. Therefore, the correct answer should involve the perineal membrane, specifically mentioning the circular hiatus within it.",
+        "question": "What structures does the urethra penetrate vertically through when passing from the pelvic cavity to the perineum?",
+        "source": {
+            "isbn": "000-0000000000",
+            "page": 0,
+            "paragraph_id": "000-0000000000-p00-para25"
+        },
+        "type": "short_inverse"
+    }
+]

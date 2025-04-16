@@ -1,0 +1,6 @@
+file_name,type,isbn
+short_QA.json,short,000-0000000000
+TF_QA.json,tf,000-0000000000
+list_QA.json,list,000-0000000000
+MC_QA.json,mc,000-0000000000
+multi_hop_QA.json,multi,000-0000000000
