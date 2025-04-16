@@ -12,6 +12,7 @@ from rouge_score import rouge_scorer
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 from transformers.pipelines import TextGenerationPipeline
+import re
 
 
 # Explicitly set HuggingFace & Torch cache paths for consistency and safety inside container
@@ -299,20 +300,33 @@ class ClinIQLinkSampleDatasetSubmit:
                 return template.format(question=question)
 
             elif qa_type == "multiple_choice":
-                # Normalize options if they are a list instead of dict
+                # Ensure options is a list and map to A–D
                 if isinstance(options, list):
-                    options = {label: opt for label, opt in zip("ABCD", options)}
+                    letter_map = {chr(65 + i): opt for i, opt in enumerate(options)}
+                else:
+                    raise ValueError("Multiple choice options should be a list.")
 
                 return template.format(
                     question=question,
-                    options_A=options.get("A", "Option A missing"),
-                    options_B=options.get("B", "Option B missing"),
-                    options_C=options.get("C", "Option C missing"),
-                    options_D=options.get("D", "Option D missing")
+                    options_A=letter_map.get("A", "Option A missing"),
+                    options_B=letter_map.get("B", "Option B missing"),
+                    options_C=letter_map.get("C", "Option C missing"),
+                    options_D=letter_map.get("D", "Option D missing"),
                 )
 
+
+
             elif qa_type == "list":
-                options_joined = "\n".join(options) if isinstance(options, list) else str(options)
+                # Assign letters (A, B, C, ...) to each option
+                if isinstance(options, list):
+                    options_dict = {chr(65 + i): opt for i, opt in enumerate(options)}
+                elif isinstance(options, dict):
+                    options_dict = options
+                else:
+                    options_dict = {"A": str(options)}
+
+                # Join options with letter prefixes (e.g., A: ..., B: ...)
+                options_joined = "\n".join(f"{k}: {v}" for k, v in options_dict.items())
                 return template.format(question=question, options_joined=options_joined)
 
             elif qa_type == "multi_hop":
@@ -382,25 +396,38 @@ class ClinIQLinkSampleDatasetSubmit:
             print(f"Error evaluating Multiple Choice question: {e}", flush=True)
             return 0.0
 
-    def evaluate_list(self, expected, prediction):
+    def evaluate_list(self, expected, prediction, options=None):
         """
         Evaluate List questions using the F1 score.
-        'expected' should be a list of strings and 'prediction' can be a comma-separated string or a list.
+        `expected`: list of correct answer strings.
+        `prediction`: string of comma-separated option letters (e.g., "A, C, E").
+        `options`: original list of options shown to the model (e.g., ["A", "B", "C", ...]).
         """
         try:
-            # Sanitize prediction to always get a list of strings
             if isinstance(prediction, list):
-                # Join list elements into a single comma-separated string, then split
                 prediction = ", ".join(str(p) for p in prediction)
 
-            pred_list = [item.strip().lower() for item in prediction.split(",")]
-            exp_list = [item.strip().lower() for item in expected]
+            pred_letters = [item.strip().upper() for item in prediction.split(",") if item.strip()]
+            
+            if not options or not isinstance(options, list):
+                print("Warning: Options missing or not a list for list-type QA.")
+                return 0.0
 
-            _, _, f1 = self.compute_f1_score(exp_list, pred_list)
+            # Build mapping of letter -> option value
+            letter_to_option = {chr(65 + idx): val.strip().lower() for idx, val in enumerate(options)}
+            # Now reverse: option value -> letter
+            option_to_letter = {v: k for k, v in letter_to_option.items()}
+
+            # Convert expected list of values to expected list of letters
+            expected_letters = [option_to_letter.get(ans.strip().lower()) for ans in expected]
+            expected_letters = [e for e in expected_letters if e]  # Remove None
+
+            _, _, f1 = self.compute_f1_score(expected_letters, pred_letters)
             return f1
         except Exception as e:
             print(f"Error evaluating List question: {e}", flush=True)
             return 0.0
+
 
 
 
@@ -516,10 +543,12 @@ class ClinIQLinkSampleDatasetSubmit:
         """
         try:
             smoothing_function = SmoothingFunction().method1
-            expected_tokens = nltk.word_tokenize(expected)
-            predicted_tokens = nltk.word_tokenize(prediction)
+            expected_tokens = nltk.word_tokenize(expected) if isinstance(expected, str) else expected
+            predicted_tokens = nltk.word_tokenize(prediction) if isinstance(prediction, str) else prediction
+
             bleu = sentence_bleu([expected_tokens], predicted_tokens, smoothing_function=smoothing_function)
             meteor = meteor_score([' '.join(expected_tokens)], ' '.join(predicted_tokens))
+
             scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
             rouge_scores = scorer.score(expected, prediction)
             rouge_avg = (rouge_scores['rouge1'].fmeasure + rouge_scores['rougeL'].fmeasure) / 2.0
@@ -530,7 +559,7 @@ class ClinIQLinkSampleDatasetSubmit:
 
 
 
-    def participant_model(self, prompt):
+    def participant_model(self, prompt, qa_type=None):
         """
         Uses the participant's loaded model to generate a response based on the given prompt.
         If a Hugging Face model is detected, it will use a text-generation pipeline.
@@ -563,7 +592,31 @@ class ClinIQLinkSampleDatasetSubmit:
             print(f"Error during inference: {e}", flush=True)
             response = "ERROR DURING INFERENCE"
 
+        # Post-process to extract clean answer based on QA type
+        if isinstance(response, str):
+            response_clean = response.strip().lower()
+
+            if qa_type == "true_false":
+                if "true" in response_clean:
+                    response = "true"
+                elif "false" in response_clean:
+                    response = "false"
+
+            elif qa_type == "multiple_choice":
+                # Extract single letter A–D
+                match = re.search(r"\b[a-d]\b", response_clean)
+                response = match.group() if match else response_clean
+
+            elif qa_type == "list":
+                # Return comma-separated list or split lines
+                response = ", ".join(re.findall(r"[a-zA-Z0-9\s\-]+", response_clean))
+
+            elif qa_type in {"short", "multi_hop", "short_inverse", "multi_hop_inverse"}:
+                # For open-ended questions, return the trimmed response directly
+                response = response_clean
+
         return response
+
 
     def evaluate_true_false_questions(self):
         """
@@ -581,7 +634,7 @@ class ClinIQLinkSampleDatasetSubmit:
             for qa in tf_data:
                 try:
                     prompt = self.generate_prompt(template, qa, "true_false")
-                    response = self.participant_model(prompt)
+                    response = self.participant_model(prompt, qa_type="true_false")  # or "multiple_choice", etc.
                     expected = qa.get("answer", "").strip().lower()
                     predicted = response.strip().lower()
                     score = self.evaluate_true_false(expected, predicted)
@@ -619,17 +672,25 @@ class ClinIQLinkSampleDatasetSubmit:
             for qa in mc_data:
                 try:
                     prompt = self.generate_prompt(template, qa, "multiple_choice")
-                    response = self.participant_model(prompt)
-                    expected = qa.get("correct_answer", "").strip().lower()
-                    predicted = response.strip().lower()
-                    score = self.evaluate_multiple_choice(expected, predicted)
+                    response = self.participant_model(prompt, qa_type="multiple_choice") 
+                    expected_value = qa.get("correct_answer", "").strip().lower()
+                    options = qa.get("options", [])
+                    letter_map = {chr(65 + i): opt.strip().lower() for i, opt in enumerate(options)}
+                    value_to_letter = {v: k for k, v in letter_map.items()}
+                    expected_letter = value_to_letter.get(expected_value)
+
+                    # Compare to model's predicted letter
+                    predicted = response.strip().upper()
+                    score = 1.0 if predicted == expected_letter else 0.0
+
                     para_id = qa.get("source", {}).get("paragraph_id", "unknown")
                     results[para_id] = {
                         "question": qa.get("question", ""),
-                        "expected": expected,
+                        "expected": expected_letter,
                         "predicted": predicted,
                         "score": score
                     }
+
                     scores.append(score)
                 except Exception as inner_e:
                     print(f"Error processing Multiple Choice QA: {inner_e}", flush=True)
@@ -643,11 +704,10 @@ class ClinIQLinkSampleDatasetSubmit:
 
     def evaluate_list_questions(self):
         """
-        Evaluate all List questions using the F1 score.
-        Returns a dictionary containing the average F1 score and a mapping (by paragraph_id) of individual QA scores.
+        Evaluate all List questions using the F1 score based on letter options (e.g., A, B, C).
         """
         try:
-            list_data = self.sampled_qa_pairs.get("list", [])           # List
+            list_data = self.sampled_qa_pairs.get("list", [])
             if list_data is None:
                 print("No List data loaded.", flush=True)
                 return {"average": 0.0, "scores": {}}
@@ -657,15 +717,37 @@ class ClinIQLinkSampleDatasetSubmit:
             for qa in list_data:
                 try:
                     prompt = self.generate_prompt(template, qa, "list")
-                    response = self.participant_model(prompt)
-                    expected_items = [item.strip().lower() for item in qa.get("answer", [])]
-                    predicted_items = [item.strip().lower() for item in response.split(",")]
-                    _, _, f1 = self.compute_f1_score(expected_items, predicted_items)
+                    response = self.participant_model(prompt, qa_type="list")
+                    
+                    options = qa.get("options", [])
+                    # Build letter → option and reverse
+                    letter_to_option = {chr(65 + i): opt.strip().lower() for i, opt in enumerate(options)}
+                    option_to_letter = {v: k for k, v in letter_to_option.items()}
+                    
+                    expected_values = [ans.strip().lower() for ans in qa.get("answer", [])]
+                    expected_letters = [option_to_letter.get(v) for v in expected_values if option_to_letter.get(v)]
+                    
+                    # Clean and deduplicate predictions
+                    predicted_letters = list(set(
+                        [x.strip().upper() for x in response.split(",") if x.strip().upper() in letter_to_option]
+                    ))
+
+                    # Clean and deduplicate expected answers
+                    expected_values = [ans.strip().lower() for ans in qa.get("answer", [])]
+                    expected_letters = list(set(
+                        [option_to_letter.get(v) for v in expected_values if option_to_letter.get(v)]
+                    ))
+                    
+                    predicted_letters.sort()
+                    expected_letters.sort()
+
+                    _, _, f1 = self.compute_f1_score(expected_letters, predicted_letters)
                     para_id = qa.get("source", {}).get("paragraph_id", "unknown")
+
                     results[para_id] = {
                         "question": qa.get("question", ""),
-                        "expected": expected_items,
-                        "predicted": predicted_items,
+                        "expected": expected_letters,
+                        "predicted": predicted_letters,
                         "score": f1
                     }
                     scores.append(f1)
@@ -677,6 +759,7 @@ class ClinIQLinkSampleDatasetSubmit:
         except Exception as e:
             print(f"Error evaluating List questions: {e}", flush=True)
             return {"average": 0.0, "scores": {}}
+
 
 
     def evaluate_short_questions(self):
@@ -695,7 +778,7 @@ class ClinIQLinkSampleDatasetSubmit:
             for qa in short_data:
                 try:
                     prompt = self.generate_prompt(template, qa, "short")
-                    response = self.participant_model(prompt)
+                    response = self.participant_model(prompt, qa_type="short") 
                     expected = qa.get("answer", "")
                     f1_score = self.evaluate_open_ended(expected, response)
                     metrics = self.evaluate_open_ended_metrics(expected, response)
@@ -734,8 +817,8 @@ class ClinIQLinkSampleDatasetSubmit:
             for qa in short_inverse_data:
                 try:
                     prompt = self.generate_prompt(template, qa, "short_inverse")
-                    response = self.participant_model(prompt)
-                    print("Short Inverse Response:", response, flush=True)
+                    response = self.participant_model(prompt, qa_type="short_inverse") 
+                    # print("Short Inverse Response:", response, flush=True)
                     # Use the provided incorrect explanation as the expected text.
                     expected = qa.get("incorrect_explanation", "")
                     f1_score = self.evaluate_open_ended(expected, response)
@@ -776,7 +859,7 @@ class ClinIQLinkSampleDatasetSubmit:
             for qa in mh_data:
                 try:
                     prompt = self.generate_prompt(template, qa, "multi_hop")
-                    response = self.participant_model(prompt)
+                    response = self.participant_model(prompt, qa_type="multi_hop") 
                     expected = qa.get("answer", "")
                     f1_score = self.evaluate_open_ended(expected, response)
                     metrics = self.evaluate_open_ended_metrics(expected, response)
@@ -816,8 +899,8 @@ class ClinIQLinkSampleDatasetSubmit:
             for qa in mh_inverse_data:
                 try:
                     prompt = self.generate_prompt(template, qa, "multi_hop_inverse")
-                    response = self.participant_model(prompt)
-                    print("Multi-hop Inverse Response:", response, flush=True)
+                    response = self.participant_model(prompt, qa_type="multi_hop_inverse") 
+                    # print("Multi-hop Inverse Response:", response, flush=True)
                     # Use the provided incorrect reasoning step as the expected text.
                     expected = qa.get("incorrect_reasoning_step", "")
                     f1_score = self.evaluate_open_ended(expected, response)
@@ -856,9 +939,9 @@ class ClinIQLinkSampleDatasetSubmit:
             overall_results["multi_hop_inverse"] = self.evaluate_multi_hop_inverse_questions()
             
             overall_json = json.dumps(overall_results, indent=2)
-            print("Overall Evaluation Results:", overall_json, flush=True)
+            # print("Overall Evaluation Results:", overall_json, flush=True)
             
-            output_file = os.path.join(self.base_dir, "overall_evaluation_results.json")
+            output_file = os.environ.get("RESULTS_PATH", "/tmp/overall_evaluation_results.json")
             with open(output_file, "w") as f:
                 json.dump(overall_results, f, indent=2)
             print(f"Saved overall evaluation results to {output_file}", flush=True)

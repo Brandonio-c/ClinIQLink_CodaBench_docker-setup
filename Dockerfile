@@ -22,6 +22,11 @@ ENV NLTK_DATA=/usr/local/nltk_data
 ENV HF_HOME=/app/.cache/huggingface
 ENV TRANSFORMERS_CACHE=/app/.cache/transformers
 ENV TORCH_HOME=/app/.cache/torch
+ENV RESULTS_PATH=/tmp/overall_evaluation_results.json
+ENV USE_INTERNAL_MODEL=1
+
+# Create necessary directories
+RUN mkdir -p /app/results /usr/local/nltk_data && chmod -R a+rwX /app /usr/local/nltk_data /app/results
 
 # Copy requirements first to leverage Docker caching
 COPY submission/requirements.txt /app/requirements.txt
