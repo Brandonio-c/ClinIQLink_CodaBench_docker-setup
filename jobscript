@@ -1,0 +1,25 @@
+#!/bin/bash
+#SBATCH --job-name=ClinIQLink_Eval                      # Job name
+#SBATCH --output=output/stdout/ClinIQLink_Eval-%j.out   # Standard output and error log
+#SBATCH --error=output/stderr/ClinIQLink_Eval-%j.err    # Error log file
+#SBATCH --time=72:00:00                                 # Time limit hh:mm:ss
+#SBATCH --partition=gpu                                 # GPU partition (modify as per your HPC setup)
+#SBATCH --gres=gpu:a100:2                               # Request 2 GPUs
+#SBATCH --cpus-per-task=16                              # Number of CPU cores per task
+#SBATCH --mem=128G                                      # Memory per node
+#SBATCH --ntasks=1                                      # Run a single task
+
+# Navigate to container directory
+cd /path/to/directory
+
+# Load apptainer module
+module load apptainer
+
+# Run container with binded directories
+apptainer run \
+    --nv \
+    --bind output:/output \
+    --bind data:/app/data \
+    --bind /path/to/model:/app/model_submission \
+    --bind submission:/app \
+    cliniqlink_submission.sif
