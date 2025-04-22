@@ -3,10 +3,8 @@ import os
 import random
 import numpy as np
 import argparse
-import argparse
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
-from nltk.tokenize import word_tokenize
 from nltk.tokenize import word_tokenize
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from nltk.translate.meteor_score import meteor_score
@@ -264,9 +262,6 @@ class ClinIQLinkSampleDatasetSubmit:
                     flat_data = [item for sublist in data for item in (sublist if isinstance(sublist, list) else [sublist])]
                     sampled_data = random.sample(flat_data, min(sample_size, len(flat_data)))
 
-                    flat_data = [item for sublist in data for item in (sublist if isinstance(sublist, list) else [sublist])]
-                    sampled_data = random.sample(flat_data, min(sample_size, len(flat_data)))
-
 
                     sampled_qa[qa_type] = sampled_data
 
@@ -282,25 +277,15 @@ class ClinIQLinkSampleDatasetSubmit:
         """
         Generates a prompt for a single QA dictionary using the specified template.
         
-        Generates a prompt for a single QA dictionary using the specified template.
-        
         Args:
-            template (str): The prompt template string with placeholders.
-            qa (dict or list): A dictionary representing the QA pair, or a list of such dicts.
-            qa_type (str): The QA type (e.g., "true_false", "multiple_choice", "list", etc.).
             template (str): The prompt template string with placeholders.
             qa (dict or list): A dictionary representing the QA pair, or a list of such dicts.
             qa_type (str): The QA type (e.g., "true_false", "multiple_choice", "list", etc.).
 
         Returns:
             str: The formatted prompt or an error message.
-            str: The formatted prompt or an error message.
         """
         try:
-            if not isinstance(qa, dict):
-                print(f"Error: QA is not a dictionary after unpacking. Type: {type(qa)}")
-                return "Invalid QA input."
-
             if not isinstance(qa, dict):
                 print(f"Error: QA is not a dictionary after unpacking. Type: {type(qa)}")
                 return "Invalid QA input."
@@ -313,17 +298,10 @@ class ClinIQLinkSampleDatasetSubmit:
             false_answer = qa.get("false_answer", "")
 
             # Format based on QA type
-            # Format based on QA type
             if qa_type == "true_false":
                 return template.format(question=question)
 
             elif qa_type == "multiple_choice":
-                # Ensure options is a list and map to A–D
-                if isinstance(options, list):
-                    letter_map = {chr(65 + i): opt for i, opt in enumerate(options)}
-                else:
-                    raise ValueError("Multiple choice options should be a list.")
-
                 # Ensure options is a list and map to A–D
                 if isinstance(options, list):
                     letter_map = {chr(65 + i): opt for i, opt in enumerate(options)}
@@ -336,28 +314,11 @@ class ClinIQLinkSampleDatasetSubmit:
                     options_B=letter_map.get("B", "Option B missing"),
                     options_C=letter_map.get("C", "Option C missing"),
                     options_D=letter_map.get("D", "Option D missing"),
-                    options_A=letter_map.get("A", "Option A missing"),
-                    options_B=letter_map.get("B", "Option B missing"),
-                    options_C=letter_map.get("C", "Option C missing"),
-                    options_D=letter_map.get("D", "Option D missing"),
                 )
 
 
 
-
-
             elif qa_type == "list":
-                # Assign letters (A, B, C, ...) to each option
-                if isinstance(options, list):
-                    options_dict = {chr(65 + i): opt for i, opt in enumerate(options)}
-                elif isinstance(options, dict):
-                    options_dict = options
-                else:
-                    options_dict = {"A": str(options)}
-
-                # Join options with letter prefixes (e.g., A: ..., B: ...)
-                options_joined = "\n".join(f"{k}: {v}" for k, v in options_dict.items())
-                return template.format(question=question, options_joined=options_joined)
                 # Assign letters (A, B, C, ...) to each option
                 if isinstance(options, list):
                     options_dict = {chr(65 + i): opt for i, opt in enumerate(options)}
@@ -375,13 +336,11 @@ class ClinIQLinkSampleDatasetSubmit:
 
             elif qa_type == "multi_hop_inverse":
                 return template.format(question=question, answer=answer, reasoning=reasoning)
-                return template.format(question=question, answer=answer, reasoning=reasoning)
 
             elif qa_type == "short":
                 return template.format(question=question)
 
             elif qa_type == "short_inverse":
-                return template.format(question=question, false_answer=false_answer)
                 return template.format(question=question, false_answer=false_answer)
 
             else:
@@ -391,17 +350,8 @@ class ClinIQLinkSampleDatasetSubmit:
         except KeyError as ke:
             print(f"KeyError during prompt generation: {ke}")
             return f"Missing key in QA object: {ke}"
-                print(f"Warning: Unknown QA type '{qa_type}'")
-                return f"Unsupported QA type: {qa_type}"
-
-        except KeyError as ke:
-            print(f"KeyError during prompt generation: {ke}")
-            return f"Missing key in QA object: {ke}"
 
         except Exception as e:
-            print(f"Exception in generate_prompt: {e}")
-            print("QA Type:", qa_type)
-            print("QA Object Dump:", json.dumps(qa, indent=2))
             print(f"Exception in generate_prompt: {e}")
             print("QA Type:", qa_type)
             print("QA Object Dump:", json.dumps(qa, indent=2))
@@ -447,36 +397,13 @@ class ClinIQLinkSampleDatasetSubmit:
             return 0.0
 
     def evaluate_list(self, expected, prediction, options=None):
-    def evaluate_list(self, expected, prediction, options=None):
         """
         Evaluate List questions using the F1 score.
         `expected`: list of correct answer strings.
         `prediction`: string of comma-separated option letters (e.g., "A, C, E").
         `options`: original list of options shown to the model (e.g., ["A", "B", "C", ...]).
-        `expected`: list of correct answer strings.
-        `prediction`: string of comma-separated option letters (e.g., "A, C, E").
-        `options`: original list of options shown to the model (e.g., ["A", "B", "C", ...]).
         """
         try:
-            if isinstance(prediction, list):
-                prediction = ", ".join(str(p) for p in prediction)
-
-            pred_letters = [item.strip().upper() for item in prediction.split(",") if item.strip()]
-            
-            if not options or not isinstance(options, list):
-                print("Warning: Options missing or not a list for list-type QA.")
-                return 0.0
-
-            # Build mapping of letter -> option value
-            letter_to_option = {chr(65 + idx): val.strip().lower() for idx, val in enumerate(options)}
-            # Now reverse: option value -> letter
-            option_to_letter = {v: k for k, v in letter_to_option.items()}
-
-            # Convert expected list of values to expected list of letters
-            expected_letters = [option_to_letter.get(ans.strip().lower()) for ans in expected]
-            expected_letters = [e for e in expected_letters if e]  # Remove None
-
-            _, _, f1 = self.compute_f1_score(expected_letters, pred_letters)
             if isinstance(prediction, list):
                 prediction = ", ".join(str(p) for p in prediction)
 
@@ -579,12 +506,6 @@ class ClinIQLinkSampleDatasetSubmit:
             if isinstance(prediction, list):
                 prediction = " ".join(prediction)
 
-            # Ensure inputs are strings (not lists)
-            if isinstance(expected, list):
-                expected = " ".join(expected)
-            if isinstance(prediction, list):
-                prediction = " ".join(prediction)
-
             if expected.strip().lower() == prediction.strip().lower():
                 return 1.0
 
@@ -621,12 +542,6 @@ class ClinIQLinkSampleDatasetSubmit:
             bleu = sentence_bleu([expected_tokens], predicted_tokens, smoothing_function=smoothing_function)
             meteor = meteor_score([' '.join(expected_tokens)], ' '.join(predicted_tokens))
 
-            expected_tokens = nltk.word_tokenize(expected) if isinstance(expected, str) else expected
-            predicted_tokens = nltk.word_tokenize(prediction) if isinstance(prediction, str) else prediction
-
-            bleu = sentence_bleu([expected_tokens], predicted_tokens, smoothing_function=smoothing_function)
-            meteor = meteor_score([' '.join(expected_tokens)], ' '.join(predicted_tokens))
-
             scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
             rouge_scores = scorer.score(expected, prediction)
             rouge_avg = (rouge_scores['rouge1'].fmeasure + rouge_scores['rougeL'].fmeasure) / 2.0
@@ -653,7 +568,6 @@ class ClinIQLinkSampleDatasetSubmit:
             # If using a PyTorch model with a `generate` method
             elif hasattr(self.model, "generate"):
                 input_ids = self.tokenizer.encode(prompt, return_tensors="pt")
-                output_ids = self.model.generate(input_ids, max_length=self.max_length)
                 output_ids = self.model.generate(input_ids, max_length=self.max_length)
                 response = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
@@ -692,31 +606,7 @@ class ClinIQLinkSampleDatasetSubmit:
                 # For open-ended questions, return the trimmed response directly
                 response = response_clean
 
-        # Post-process to extract clean answer based on QA type
-        if isinstance(response, str):
-            response_clean = response.strip().lower()
-
-            if qa_type == "true_false":
-                if "true" in response_clean:
-                    response = "true"
-                elif "false" in response_clean:
-                    response = "false"
-
-            elif qa_type == "multiple_choice":
-                # Extract single letter A–D
-                match = re.search(r"\b[a-d]\b", response_clean)
-                response = match.group() if match else response_clean
-
-            elif qa_type == "list":
-                # Return comma-separated list or split lines
-                response = ", ".join(re.findall(r"[a-zA-Z0-9\s\-]+", response_clean))
-
-            elif qa_type in {"short", "multi_hop", "short_inverse", "multi_hop_inverse"}:
-                # For open-ended questions, return the trimmed response directly
-                response = response_clean
-
         return response
-
 
     def evaluate_true_false_questions(self):
         """
@@ -823,7 +713,6 @@ class ClinIQLinkSampleDatasetSubmit:
                         "score": score
                     }
 
-
                     scores.append(score)
 
                 except Exception as e:
@@ -842,10 +731,8 @@ class ClinIQLinkSampleDatasetSubmit:
     def evaluate_list_questions(self):
         """
         Evaluate all List questions using the F1 score based on letter options (e.g., A, B, C).
-        Evaluate all List questions using the F1 score based on letter options (e.g., A, B, C).
         """
         try:
-            list_data = self.sampled_qa_pairs.get("list", [])
             list_data = self.sampled_qa_pairs.get("list", [])
             if list_data is None:
                 print("No List data loaded.", flush=True)
@@ -881,38 +768,10 @@ class ClinIQLinkSampleDatasetSubmit:
                     expected_letters.sort()
 
                     _, _, f1 = self.compute_f1_score(expected_letters, predicted_letters)
-                    response = self.participant_model(prompt, qa_type="list")
-                    
-                    options = qa.get("options", [])
-                    # Build letter → option and reverse
-                    letter_to_option = {chr(65 + i): opt.strip().lower() for i, opt in enumerate(options)}
-                    option_to_letter = {v: k for k, v in letter_to_option.items()}
-                    
-                    expected_values = [ans.strip().lower() for ans in qa.get("answer", [])]
-                    expected_letters = [option_to_letter.get(v) for v in expected_values if option_to_letter.get(v)]
-                    
-                    # Clean and deduplicate predictions
-                    predicted_letters = list(set(
-                        [x.strip().upper() for x in response.split(",") if x.strip().upper() in letter_to_option]
-                    ))
-
-                    # Clean and deduplicate expected answers
-                    expected_values = [ans.strip().lower() for ans in qa.get("answer", [])]
-                    expected_letters = list(set(
-                        [option_to_letter.get(v) for v in expected_values if option_to_letter.get(v)]
-                    ))
-                    
-                    predicted_letters.sort()
-                    expected_letters.sort()
-
-                    _, _, f1 = self.compute_f1_score(expected_letters, predicted_letters)
                     para_id = qa.get("source", {}).get("paragraph_id", "unknown")
-
 
                     results[para_id] = {
                         "question": qa.get("question", ""),
-                        "expected": expected_letters,
-                        "predicted": predicted_letters,
                         "expected": expected_letters,
                         "predicted": predicted_letters,
                         "score": f1
@@ -943,7 +802,6 @@ class ClinIQLinkSampleDatasetSubmit:
             for qa in short_data:
                 try:
                     prompt = self.generate_prompt(template, qa, "short")
-                    response = self.participant_model(prompt, qa_type="short") 
                     response = self.participant_model(prompt, qa_type="short") 
                     expected = qa.get("answer", "")
                     f1_score = self.evaluate_open_ended(expected, response)
@@ -982,8 +840,6 @@ class ClinIQLinkSampleDatasetSubmit:
             for qa in short_inverse_data:
                 try:
                     prompt = self.generate_prompt(template, qa, "short_inverse")
-                    response = self.participant_model(prompt, qa_type="short_inverse") 
-                    # print("Short Inverse Response:", response, flush=True)
                     response = self.participant_model(prompt, qa_type="short_inverse") 
                     # print("Short Inverse Response:", response, flush=True)
                     # Use the provided incorrect explanation as the expected text.
@@ -1026,7 +882,6 @@ class ClinIQLinkSampleDatasetSubmit:
                 try:
                     prompt = self.generate_prompt(template, qa, "multi_hop")
                     response = self.participant_model(prompt, qa_type="multi_hop") 
-                    response = self.participant_model(prompt, qa_type="multi_hop") 
                     expected = qa.get("answer", "")
                     f1_score = self.evaluate_open_ended(expected, response)
                     metrics = self.evaluate_open_ended_metrics(expected, response)
@@ -1067,8 +922,6 @@ class ClinIQLinkSampleDatasetSubmit:
                     prompt = self.generate_prompt(template, qa, "multi_hop_inverse")
                     response = self.participant_model(prompt, qa_type="multi_hop_inverse") 
                     # print("Multi-hop Inverse Response:", response, flush=True)
-                    response = self.participant_model(prompt, qa_type="multi_hop_inverse") 
-                    # print("Multi-hop Inverse Response:", response, flush=True)
                     # Use the provided incorrect reasoning step as the expected text.
                     expected = qa.get("incorrect_reasoning_step", "")
                     f1_score = self.evaluate_open_ended(expected, response)
@@ -1096,7 +949,7 @@ class ClinIQLinkSampleDatasetSubmit:
         Run evaluations for all QA types and save the overall results to a JSON file.
         """
         try:
-            output_file = '/output/overall_evaluation_results.json'
+            output_file = '/output/overall_evaluation_results_partial.json'
 
             overall_results = {}
             overall_results["true_false"] = self.evaluate_true_false_questions()
@@ -1168,17 +1021,6 @@ def parse_args():
     return parser.parse_args()
 
 if __name__ == "__main__":
-    args = parse_args()
-    sample_sizes = {
-        "num_tf": args.num_tf,
-        "num_mc": args.num_mc,
-        "num_list": args.num_list,
-        "num_short": args.num_short,
-        "num_short_inv": args.num_short_inv,
-        "num_multi": args.num_multi,
-        "num_multi_inv": args.num_multi_inv,
-    }
-    evaluator = ClinIQLinkSampleDatasetSubmit(run_mode=args.mode, max_length=args.max_length, sample_sizes=sample_sizes)
     args = parse_args()
     sample_sizes = {
         "num_tf": args.num_tf,
