@@ -85,7 +85,9 @@ class ClinIQLinkSampleDatasetSubmit:
         else:
             model_dir_env = os.getenv("USE_INTERNAL_MODEL", "1").strip().lower()
             if model_dir_env in ["1", "true", "yes"]:
-                model_submissions_dir = os.path.join(self.base_dir, "model_submission")
+                print(self.base_dir)
+                print(os.path.join(self.base_dir, "model_submission"))
+                model_submissions_dir = os.path.join(self.base_dir, "model_submission/snapshots")
             else:
                 model_submissions_dir = os.path.join(self.base_dir, "model_submission/snapshots")
         
@@ -102,7 +104,7 @@ class ClinIQLinkSampleDatasetSubmit:
                 print(f"Loading Hugging Face model from: {entry_path}", flush=True)
                 try:
                     model = AutoModelForCausalLM.from_pretrained(entry_path, trust_remote_code=True, use_safetensors=True, device_map="auto", torch_dtype=torch.bfloat16)
-                    self.tokenizer = AutoTokenizer.from_pretrained(entry_path, trust_remote_code=True)
+                    self.tokenizer = AutoTokenizer.from_pretrained(entry_path, trust_remote_code=True, padding=True, padding_side="left")
                     print("Participant's Hugging Face model loaded successfully.", flush=True)
                     print(model.hf_device_map)
 
@@ -162,7 +164,7 @@ class ClinIQLinkSampleDatasetSubmit:
         else:
             model_dir_env = os.getenv("USE_INTERNAL_MODEL", "1").strip().lower()
             if model_dir_env in ["1", "true", "yes"]:
-                model_submissions_dir = os.path.join(self.base_dir, "model_submission")
+                model_submissions_dir = os.path.join(self.base_dir, "model_submission/snapshots")
             else:
                 model_submissions_dir = os.path.join(self.base_dir, "model_submission/snapshots")
         
@@ -177,7 +179,7 @@ class ClinIQLinkSampleDatasetSubmit:
             if os.path.isdir(entry_path) and "config.json" in os.listdir(entry_path):
                 print(f"Loading Hugging Face model from: {entry_path}", flush=True)
                 try:
-                    return pipeline("text-generation", model=self.model, tokenizer=self.tokenizer, batch_size=2)
+                    return pipeline("text-generation", model=self.model, tokenizer=self.tokenizer, batch_size=8)
                 except Exception as e:
                     print(f"Failed to load Hugging Face model: {e}", flush=True)
 
@@ -563,7 +565,7 @@ class ClinIQLinkSampleDatasetSubmit:
         try:
             # If using a Hugging Face model
             if isinstance(self.pipeline, TextGenerationPipeline):
-                response = self.pipeline(prompt, max_length=self.max_length, do_sample=False)[0]['generated_text']
+                response = self.pipeline(prompt, max_length=self.max_length, do_sample=False)
             
             # If using a PyTorch model with a `generate` method
             elif hasattr(self.model, "generate"):
@@ -641,7 +643,7 @@ class ClinIQLinkSampleDatasetSubmit:
             for i in range(len(tf_data)):
                 try:
                     expected = tf_data[i].get("answer", "").strip().lower()
-                    predicted = responses[i].strip().lower()
+                    predicted = responses[i]['generated_text'].strip().lower()
                     score = self.evaluate_true_false(expected, predicted)
                     para_id = tf_data[i].get("source", {}).get("paragraph_id", "unknown")
                     results[para_id] = {
@@ -685,13 +687,13 @@ class ClinIQLinkSampleDatasetSubmit:
                     prompts.append(self.generate_prompt(template, qa, "multiple_choice"))
 
                 except Exception as e:
-                    print(f"Error generating batch True/False QA: {e}", flush=True)
+                    print(f"Error generating batch Multiple Choice questions: {e}", flush=True)
 
             try:
                 responses = self.participant_model(prompts, qa_type="multiple_choice")
 
             except Exception as e:
-                print(f"Error processing True/False QA: {e}", flush=True)
+                print(f"Error processing Multiple Choice questions: {e}", flush=True)
 
             for i in range(len(mc_data)):
                 try:
@@ -702,7 +704,7 @@ class ClinIQLinkSampleDatasetSubmit:
                     expected_letter = value_to_letter.get(expected_value)
 
                     # Compare to model's predicted letter
-                    predicted = responses[i].strip().upper()
+                    predicted = responses[i]['generated_text'].strip().upper()
                     score = 1.0 if predicted == expected_letter else 0.0
 
                     para_id = mc_data.get("source", {}).get("paragraph_id", "unknown")
@@ -740,26 +742,38 @@ class ClinIQLinkSampleDatasetSubmit:
             template = self.load_template("list_template.prompt")
             results = {}
             scores = []
+            prompts = []
+
             for qa in list_data:
                 try:
-                    prompt = self.generate_prompt(template, qa, "list")
-                    response = self.participant_model(prompt, qa_type="list")
-                    
-                    options = qa.get("options", [])
+                    prompts.append(self.generate_prompt(template, qa, "list"))
+
+                except Exception as inner_e:
+                    print(f"Error generating batch List QA: {inner_e}", flush=True)
+
+            try:
+                responses = self.participant_model(prompts, qa_type="list")
+
+            except Exception as inner_e:
+                print(f"Error processing List QA: {inner_e}", flush=True)
+
+            for i in range(len(list_data)):
+                try:
+                    options = list_data[i].get("options", [])
                     # Build letter → option and reverse
                     letter_to_option = {chr(65 + i): opt.strip().lower() for i, opt in enumerate(options)}
                     option_to_letter = {v: k for k, v in letter_to_option.items()}
                     
-                    expected_values = [ans.strip().lower() for ans in qa.get("answer", [])]
+                    expected_values = [ans.strip().lower() for ans in list_data[i].get("answer", [])]
                     expected_letters = [option_to_letter.get(v) for v in expected_values if option_to_letter.get(v)]
                     
                     # Clean and deduplicate predictions
                     predicted_letters = list(set(
-                        [x.strip().upper() for x in response.split(",") if x.strip().upper() in letter_to_option]
+                        [x.strip().upper() for x in responses[i]['generated_text'].split(",") if x.strip().upper() in letter_to_option]
                     ))
 
                     # Clean and deduplicate expected answers
-                    expected_values = [ans.strip().lower() for ans in qa.get("answer", [])]
+                    expected_values = [ans.strip().lower() for ans in list_data[i].get("answer", [])]
                     expected_letters = list(set(
                         [option_to_letter.get(v) for v in expected_values if option_to_letter.get(v)]
                     ))
@@ -768,22 +782,27 @@ class ClinIQLinkSampleDatasetSubmit:
                     expected_letters.sort()
 
                     _, _, f1 = self.compute_f1_score(expected_letters, predicted_letters)
-                    para_id = qa.get("source", {}).get("paragraph_id", "unknown")
+                    para_id = list_data[i].get("source", {}).get("paragraph_id", "unknown")
 
                     results[para_id] = {
-                        "question": qa.get("question", ""),
+                        "question": list_data[i].get("question", ""),
                         "expected": expected_letters,
                         "predicted": predicted_letters,
                         "score": f1
                     }
                     scores.append(f1)
+
                 except Exception as inner_e:
                     print(f"Error processing List QA: {inner_e}", flush=True)
+
             overall_f1 = sum(scores) / len(scores) if scores else 0.0
             print(f"Overall List Question F1 Score: {overall_f1:.2f}", flush=True)
+
             return {"average": overall_f1, "scores": results}
+        
         except Exception as e:
             print(f"Error evaluating List questions: {e}", flush=True)
+
             return {"average": 0.0, "scores": {}}
 
     def evaluate_short_questions(self):
@@ -799,29 +818,47 @@ class ClinIQLinkSampleDatasetSubmit:
             template = self.load_template("short_template.prompt")
             results = {}
             scores = []
+            prompts = []
+
             for qa in short_data:
                 try:
-                    prompt = self.generate_prompt(template, qa, "short")
-                    response = self.participant_model(prompt, qa_type="short") 
-                    expected = qa.get("answer", "")
-                    f1_score = self.evaluate_open_ended(expected, response)
-                    metrics = self.evaluate_open_ended_metrics(expected, response)
-                    para_id = qa.get("source", {}).get("paragraph_id", "unknown")
+                    prompts.append(self.generate_prompt(template, qa, "short"))
+
+                except Exception as inner_e:
+                    print(f"Error generating batch Short Answer QA: {inner_e}", flush=True)
+
+            try:
+                responses = self.participant_model(prompts, qa_type="short")
+
+            except Exception as inner_e:
+                print(f"Error processing Short Answer QA: {inner_e}", flush=True)
+
+            for i in range(len(short_data)):
+                try: 
+                    expected = short_data[i].get("answer", "")
+                    f1_score = 0.0 # self.evaluate_open_ended(expected, responses[i]['generated_text'])
+                    metrics = {"bleu": 0.0, "meteor": 0.0, "rouge": 0.0} # self.evaluate_open_ended_metrics(expected, responses[i]['generated_text'])
+                    para_id = short_data[i].get("source", {}).get("paragraph_id", "unknown")
                     results[para_id] = {
-                        "question": qa.get("question", ""),
+                        "question": short_data[i].get("question", ""),
                         "expected": expected,
-                        "predicted": response,
+                        "predicted": responses[i]['generated_text'],
                         "f1_score": f1_score,
                         "metrics": metrics
                     }
                     scores.append(f1_score)
+
                 except Exception as inner_e:
                     print(f"Error processing Short Answer QA: {inner_e}", flush=True)
+
             avg = sum(scores) / len(scores) if scores else 0.0
             print(f"Average Short Answer F1 Score: {avg:.2f}", flush=True)
+
             return {"average": avg, "scores": results}
+        
         except Exception as e:
             print(f"Error evaluating Short Answer questions: {e}", flush=True)
+
             return {"average": 0.0, "scores": {}}
     
     def evaluate_short_inverse_questions(self):
@@ -837,31 +874,49 @@ class ClinIQLinkSampleDatasetSubmit:
             template = self.load_template("short_inverse_template.prompt")
             results = {}
             scores = []
+            prompts = []
+
             for qa in short_inverse_data:
                 try:
-                    prompt = self.generate_prompt(template, qa, "short_inverse")
-                    response = self.participant_model(prompt, qa_type="short_inverse") 
+                    prompts.append(self.generate_prompt(template, qa, "short_inverse"))
+
+                except Exception as inner_e:
+                    print(f"Error generating batch Short Inverse QA: {inner_e}", flush=True)
+
+            try:
+                responses = self.participant_model(prompts, qa_type="short_inverse")
+
+            except Exception as inner_e:
+                print(f"Error processing Short Inverse QA: {inner_e}", flush=True)
+
+            for i in range(len(short_inverse_data)):
+                try:
                     # print("Short Inverse Response:", response, flush=True)
                     # Use the provided incorrect explanation as the expected text.
-                    expected = qa.get("incorrect_explanation", "")
-                    f1_score = self.evaluate_open_ended(expected, response)
-                    metrics = self.evaluate_open_ended_metrics(expected, response)
-                    para_id = qa.get("source", {}).get("paragraph_id", "unknown")
+                    expected = short_inverse_data[i].get("incorrect_explanation", "")
+                    f1_score = 0.0 # self.evaluate_open_ended(expected, responses[i]['generated_text'])
+                    metrics = {"bleu": 0.0, "meteor": 0.0, "rouge": 0.0} # self.evaluate_open_ended_metrics(expected, responses[i]['generated_text'])
+                    para_id = short_inverse_data[i].get("source", {}).get("paragraph_id", "unknown")
                     results[para_id] = {
-                        "question": qa.get("question", ""),
+                        "question": short_inverse_data[i].get("question", ""),
                         "expected": expected,
-                        "predicted": response,
+                        "predicted": responses[i]['generated_text'],
                         "f1_score": f1_score,
                         "metrics": metrics
                     }
                     scores.append(f1_score)
+
                 except Exception as inner_e:
-                    print(f"Error processing Short Inverse QA: {inner_e}", flush=True)
+                    print(f"Error evaluating Short Inverse QA: {inner_e}", flush=True)
+
             avg = sum(scores) / len(scores) if scores else 0.0
             print(f"Average Short Inverse F1 Score: {avg:.2f}", flush=True)
+
             return {"average": avg, "scores": results}
+        
         except Exception as e:
             print(f"Error evaluating Short Inverse questions: {e}", flush=True)
+
             return {"average": 0.0, "scores": {}}
 
     def evaluate_multi_hop_questions(self):
@@ -878,29 +933,47 @@ class ClinIQLinkSampleDatasetSubmit:
             template = self.load_template("multi_hop_template.prompt")
             results = {}
             scores = []
+            prompts = []
+
             for qa in mh_data:
                 try:
-                    prompt = self.generate_prompt(template, qa, "multi_hop")
-                    response = self.participant_model(prompt, qa_type="multi_hop") 
-                    expected = qa.get("answer", "")
-                    f1_score = self.evaluate_open_ended(expected, response)
-                    metrics = self.evaluate_open_ended_metrics(expected, response)
-                    para_id = qa.get("source", {}).get("paragraph_id", "unknown")
+                    prompts.append(self.generate_prompt(template, qa, "multi_hop"))
+
+                except Exception as inner_e:
+                    print(f"Error generating batch Multi-hop QA: {inner_e}", flush=True)
+
+            try:
+                responses = self.participant_model(prompts, qa_type="multi_hop")
+
+            except Exception as inner_e:
+                print(f"Error processing Multi-hop QA: {inner_e}", flush=True)
+
+            for i in range(len(mh_data)):
+                try:
+                    expected = mh_data[i].get("answer", "")
+                    f1_score = 0.0 # self.evaluate_open_ended(expected, responses[i]['generated_text'])
+                    metrics = {"bleu": 0.0, "meteor": 0.0, "rouge": 0.0} # self.evaluate_open_ended_metrics(expected, responses[i]['generated_text'])
+                    para_id = mh_data[i].get("source", {}).get("paragraph_id", "unknown")
                     results[para_id] = {
-                        "question": qa.get("question", ""),
+                        "question": mh_data[i].get("question", ""),
                         "expected": expected,
-                        "predicted": response,
+                        "predicted": responses[i]['generated_text'],
                         "f1_score": f1_score,
                         "metrics": metrics
                     }
                     scores.append(f1_score)
+
                 except Exception as inner_e:
-                    print(f"Error processing Multi-hop QA: {inner_e}", flush=True)
+                    print(f"Error evaluating Multi-hop QA: {inner_e}", flush=True)
+
             avg = sum(scores) / len(scores) if scores else 0.0
             print(f"Average Multi-hop F1 Score: {avg:.2f}", flush=True)
+
             return {"average": avg, "scores": results}
+        
         except Exception as e:
             print(f"Error evaluating Multi-hop questions: {e}", flush=True)
+
             return {"average": 0.0, "scores": {}}
 
     def evaluate_multi_hop_inverse_questions(self):
@@ -917,31 +990,49 @@ class ClinIQLinkSampleDatasetSubmit:
             template = self.load_template("multi_hop_inverse_template.prompt")
             results = {}
             scores = []
+            prompts = []
+
             for qa in mh_inverse_data:
                 try:
-                    prompt = self.generate_prompt(template, qa, "multi_hop_inverse")
-                    response = self.participant_model(prompt, qa_type="multi_hop_inverse") 
+                    prompts.append(self.generate_prompt(template, qa, "multi_hop_inverse"))
+
+                except Exception as inner_e:
+                    print(f"Error generating batch Multi-hop Inverse QA: {inner_e}", flush=True)
+
+            try:
+                responses = self.participant_model(prompts, qa_type="multi_hop_inverse")
+
+            except Exception as inner_e:
+                print(f"Error processing Multi-hop Inverse QA: {inner_e}", flush=True)
+
+            for i in range(len(mh_inverse_data)):
+                try:
                     # print("Multi-hop Inverse Response:", response, flush=True)
                     # Use the provided incorrect reasoning step as the expected text.
-                    expected = qa.get("incorrect_reasoning_step", "")
-                    f1_score = self.evaluate_open_ended(expected, response)
-                    metrics = self.evaluate_open_ended_metrics(expected, response)
-                    para_id = qa.get("source", {}).get("paragraph_id", "unknown")
+                    expected = mh_inverse_data[i].get("incorrect_reasoning_step", "")
+                    f1_score = 0.0 # self.evaluate_open_ended(expected, responses[i]['generated_text'])
+                    metrics = {"bleu": 0.0, "meteor": 0.0, "rouge": 0.0} # self.evaluate_open_ended_metrics(expected, responses[i]['generated_text'])
+                    para_id = mh_inverse_data[i].get("source", {}).get("paragraph_id", "unknown")
                     results[para_id] = {
-                        "question": qa.get("question", ""),
+                        "question": mh_inverse_data[i].get("question", ""),
                         "expected": expected,
-                        "predicted": response,
+                        "predicted": responses[i]['generated_text'],
                         "f1_score": f1_score,
                         "metrics": metrics
                     }
                     scores.append(f1_score)
+
                 except Exception as inner_e:
-                    print(f"Error processing Multi-hop Inverse QA: {inner_e}", flush=True)
+                    print(f"Error evaluating Multi-hop Inverse QA: {inner_e}", flush=True)
+
             avg = sum(scores) / len(scores) if scores else 0.0
             print(f"Average Multi-hop Inverse F1 Score: {avg:.2f}", flush=True)
+
             return {"average": avg, "scores": results}
+        
         except Exception as e:
             print(f"Error evaluating Multi-hop Inverse questions: {e}", flush=True)
+
             return {"average": 0.0, "scores": {}}
 
     def run_all_evaluations(self):
@@ -949,9 +1040,10 @@ class ClinIQLinkSampleDatasetSubmit:
         Run evaluations for all QA types and save the overall results to a JSON file.
         """
         try:
-            output_file = '/output/overall_evaluation_results_partial.json'
+            output_file = '/output/overall_evaluation_results.json'
 
             overall_results = {}
+
             overall_results["true_false"] = self.evaluate_true_false_questions()
 
             with open(output_file, "w") as f:
@@ -962,7 +1054,6 @@ class ClinIQLinkSampleDatasetSubmit:
             with open(output_file, "w") as f:
                 json.dump(overall_results, f, indent=4)
 
-            """
             overall_results["list"] = self.evaluate_list_questions()
 
             with open(output_file, "w") as f:
@@ -987,7 +1078,6 @@ class ClinIQLinkSampleDatasetSubmit:
             
             with open(output_file, "w") as f:
                 json.dump(overall_results, f, indent=4)
-            """
 
             print(f"Saved overall evaluation results to {output_file}", flush=True)
 
