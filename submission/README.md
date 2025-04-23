@@ -46,7 +46,7 @@ Participants should modify `submit.py` to implement their model. The script shou
 Before submitting, test the script locally by running:
 
 ```bash
-python submit.py
+python submit.py --mode local --max_length 200 --num_tf 1 --num_mc 1 --num_list 1 --num_short 1 --num_short_inv 1 --num_multi 1 --num_multi_inv 1
 ```
 
 ### 3. Using GPT-2 (Example)

@@ -3,19 +3,24 @@ From: python:3.10-slim
 
 %labels
     Maintainer "brandon.colelough@nih.gov"
-    Description "ClinIQLink image for AI model evaluation"
+    Description "ClinIQLink image for AI model submission and evaluation"
 
 %environment
     export NLTK_DATA=/usr/local/nltk_data
     export HF_HOME=/app/.cache/huggingface
     export TRANSFORMERS_CACHE=/app/.cache/transformers
     export TORCH_HOME=/app/.cache/torch
-    export RESULTS_PATH=/tmp/overall_evaluation_results.json
-    export USE_INTERNAL_MODEL=1
+
+    export MODEL_DIR=/models
     export DATA_DIR=/data
+    export OUTPUT_DIR=/results
+
+    export USE_INTERNAL_MODEL=1
+    export RESULTS_PATH=/tmp/overall_evaluation_results.json
+    export MODE=submit  # Default mode
 
 %post
-    # Install system dependencies and cleanup
+    # Install system dependencies and clean up
     apt-get update && apt-get install -y \
         build-essential \
         git \
@@ -24,30 +29,27 @@ From: python:3.10-slim
         ca-certificates && \
         rm -rf /var/lib/apt/lists/*
 
-    # Create necessary directories and set permissions
-    mkdir -p /app/results /usr/local/nltk_data
-    chmod -R a+rwX /app /usr/local/nltk_data /app/results
+    # Create expected directories and ensure group/world read-write
+    mkdir -p /app /app/results $MODEL_DIR $DATA_DIR $OUTPUT_DIR $NLTK_DATA
+    chmod -R a+rwX /app $MODEL_DIR $DATA_DIR $OUTPUT_DIR $NLTK_DATA
 
-    # Install Python dependencies from the provided requirements file
+    # Upgrade pip + install Python dependencies
     pip install --no-cache-dir --upgrade pip && \
         pip install -r /app/requirements.txt
 
-    # Download and cache NLTK data (punkt and punkt_tab)
-    mkdir -p ${NLTK_DATA} && \
-        python -m nltk.downloader punkt punkt_tab -d ${NLTK_DATA}
+    # Preload NLTK punkt and sentence-transformers model
+    python -m nltk.downloader punkt punkt_tab -d $NLTK_DATA && \
+    python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', cache_folder='/app/models')"
 
-    # Download and cache the sentence-transformers model locally
-    mkdir -p /app/models && \
-        python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', cache_folder='/app/models')"
-
-    # Ensure permissions for HPC compatibility
-    chmod -R a+rwX /app /usr/local/nltk_data
+    # Ensure final permissions
+    chmod -R a+rwX /app $MODEL_DIR $DATA_DIR $OUTPUT_DIR $NLTK_DATA
 
 %files
-    submission/requirements.txt   /app/requirements.txt
-    submission/submit.py          /app/submit.py
-    model_submission/             /app/model_submission
-    submission/submission_template/ /app/submission_template
+    submission/requirements.txt        /app/requirements.txt
+    submission/submit.py               /app/submit.py
+    submission/evaluate.py             /app/evaluate.py
+    submission/submission_template/    /app/submission_template/
+    submission/entrypoint.sh           /app/entrypoint.sh
 
 %runscript
-    exec python /app/submit.py "$@"
+    exec /app/entrypoint.sh "$@"
