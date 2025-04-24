@@ -138,6 +138,25 @@ class ClinIQLinkSampleDatasetEvaluate:
             return str(x.get("generated_text") or x.get("text") or "").strip()
 
         return str(x).strip()
+    
+    def _safe_binary_metrics(self, y_true, y_pred):
+        """
+        Precision/recall/F1 that behave sensibly when only one class is present.
+        If the two vectors are identical -> all metrics = 1.
+        If they differ -> all metrics = 0.
+        Otherwise fall back to sklearn.
+        """
+        if y_true == y_pred:
+            # exact match, can be all positives or all negatives
+            return 1.0, 1.0, 1.0
+        if set(y_true) == {0} and set(y_pred) == {0}:
+            # both all-negative but not identical (length mismatch case)
+            return 0.0, 0.0, 0.0
+
+        # normal two-class case
+        return self.compute_classification_metrics(
+            y_true, y_pred, average="binary", labels=[0,1]
+        )
 
 
     def compute_classification_metrics(self, y_true, y_pred, average="binary", labels=None):
@@ -426,7 +445,7 @@ class ClinIQLinkSampleDatasetEvaluate:
                 print(f"Label conversion error: {label_error}", flush=True)
                 return {"average": 0.0, "precision": 0.0, "recall": 0.0, "f1_score": 0.0, "scores": results}
 
-            precision, recall, f1 = self.compute_classification_metrics(true_labels, pred_labels)
+            precision, recall, f1 = self._safe_binary_metrics(true_labels, pred_labels)
             avg_score = sum(results[pid]["score"] for pid in results) / len(results) if results else 0.0
 
             print(f"True/False Precision: {precision:.2f}, Recall: {recall:.2f}, F1: {f1:.2f}", flush=True)
@@ -498,7 +517,7 @@ class ClinIQLinkSampleDatasetEvaluate:
             label_list = list(letter_map.keys()) + ["invalid"]
             precision, recall, f1 = self.compute_classification_metrics(
                 all_expected, all_predicted,
-                average="macro", labels=label_list
+                average="micro", labels=label_list
             )
             avg_score = sum(raw_scores) / len(raw_scores) if raw_scores else 0.0
 

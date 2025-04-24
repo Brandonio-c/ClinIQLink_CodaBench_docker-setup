@@ -1,4 +1,5 @@
 You are a highly knowledgeable medical expert. Answer the following list question by selecting all the correct options from the list provided.
+Respond with CAPITAL LETTERS only, separated by commas, no extra words.
 
 Question:
 {question}

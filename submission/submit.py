@@ -3,7 +3,7 @@ import os
 import random
 import argparse
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, GenerationConfig
 from transformers.pipelines import TextGenerationPipeline
 import re
 
@@ -36,6 +36,16 @@ class ClinIQLinkSampleDatasetSubmit:
         self.pipeline = self.load_participant_pipeline()
         # Load and sample the dataset
         self.sampled_qa_pairs = self.load_and_sample_dataset()
+        self.SYSTEM_MSG = (
+            "You are a highly knowledgeable medical expert. "
+            "Reply **only** with the requested answer format. "
+            "Do not repeat the question or add explanations."
+        )
+        self.CAP_LETTERS_RE = re.compile(r"\b[A-Z]\b")
+
+    def _strip_noise(text: str) -> str:
+        """remove leading blank lines + any trailing 'assistant' artefacts"""
+        return re.sub(r"\bassistant\b", "", text, flags=re.I).lstrip().rstrip()
 
     def load_participant_model(self):
         """
@@ -87,6 +97,25 @@ class ClinIQLinkSampleDatasetSubmit:
                     )
                     self.tokenizer = AutoTokenizer.from_pretrained(entry_path, trust_remote_code=True, padding=True, padding_side="left")
                     print("Participant's Hugging Face model loaded successfully.", flush=True)
+
+                    if self.tokenizer.chat_template is None:
+                        print("Setting manual chat template for LLaMA tokenizer...", flush=True)
+                        self.tokenizer.chat_template = (
+                            "{% for message in messages %}"
+                            "{% if message['role'] == 'system' %}"
+                            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
+                            "{{ message['content'] }}<|eot_id|>"
+                            "{% elif message['role'] == 'user' %}"
+                            "<|start_header_id|>user<|end_header_id|>\n"
+                            "{{ message['content'] }}<|eot_id|>"
+                            "{% elif message['role'] == 'assistant' %}"
+                            "<|start_header_id|>assistant<|end_header_id|>\n"
+                            "{{ message['content'] }}<|eot_id|>"
+                            "{% endif %}"
+                            "{% endfor %}"
+                            "<|start_header_id|>assistant<|end_header_id|>\n"
+                        )
+
                     for module, device in model.hf_device_map.items():
                         print(f"Module '{module or 'root'}' loaded on device: {device}")
 
@@ -389,53 +418,96 @@ class ClinIQLinkSampleDatasetSubmit:
             return "Error generating prompt."
 
 
+
+
     def participant_model(self, prompt, qa_type=None):
         """
         Uses the participant's loaded model to generate a response based on the given prompt.
-        If a Hugging Face model is detected, it will use a text-generation pipeline.
-        If a PyTorch or script-based model is detected, it assumes a `generate()` method exists.
+        Supports Hugging Face chat models (LLaMA-3), PyTorch models, and script-based models.
         """
         if not self.model:
             print("No participant model loaded. Returning default response.", flush=True)
             return "NO LLM IMPLEMENTED"
 
         try:
-            # If using a Hugging Face model
+            # Handle Hugging Face chat models
             if isinstance(self.pipeline, TextGenerationPipeline):
-                response = self.pipeline(prompt, max_length=self.max_length, do_sample=False)
-            
-            # If using a PyTorch model with a `generate` method
+                if isinstance(prompt, list):
+                    conversations = [
+                        [{"role": "system", "content": self.SYSTEM_MSG},
+                        {"role": "user", "content": p}]
+                        for p in prompt
+                    ]
+                    inputs = self.tokenizer.apply_chat_template(
+                        conversations,
+                        add_generation_prompt=True,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True
+                    ).to(self.model.device)
+                else:
+                    conversations = [
+                        {"role": "system", "content": self.SYSTEM_MSG},
+                        {"role": "user", "content": prompt}
+                    ]
+                    inputs = self.tokenizer.apply_chat_template(
+                        conversations,
+                        add_generation_prompt=True,
+                        return_tensors="pt"
+                    ).to(self.model.device)
+
+                eot_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
+                gen_cfg = GenerationConfig(
+                        max_new_tokens = {
+                            "multiple_choice": 12,
+                            "list": 16,
+                            "true_false": 8,
+                            "short": 48,
+                            "short_inverse": 64,
+                            "multi_hop": 128,
+                            "multi_hop_inverse": 128,
+                        }.get(qa_type, 32),
+                        temperature = 0.0,
+                        top_p = 1.0,
+                        eos_token_id = eot_id,
+                        pad_token_id = self.tokenizer.eos_token_id,
+                    )
+
+                output_ids = self.model.generate(inputs, generation_config=gen_cfg)
+                response = self.tokenizer.batch_decode(
+                    output_ids[:, inputs.shape[-1]:], skip_special_tokens=True
+                )
+
+                response = response if isinstance(prompt, list) else response[0]
+
+            # Handle PyTorch models directly
             elif hasattr(self.model, "generate"):
                 if isinstance(prompt, list):
                     input_ids = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)["input_ids"]
                 else:
                     input_ids = self.tokenizer(prompt, return_tensors="pt")["input_ids"]
-
-                input_ids = input_ids.to(self.model.device)  # Ensure it matches model's device
-
+                input_ids = input_ids.to(self.model.device)
                 with torch.no_grad():
                     output_ids = self.model.generate(input_ids, max_length=self.max_length)
+                response = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+                response = response if isinstance(prompt, list) else response[0]
 
-                responses = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-
-                return responses if isinstance(prompt, list) else responses[0]
-
-
-            # If using a script-based model with a callable function
+            # Script-based model
             elif callable(self.model):
                 response = self.model(prompt)
 
             else:
                 print("Unknown model type. Returning default response.", flush=True)
                 response = "NO LLM IMPLEMENTED"
-        
+
         except Exception as e:
             print(f"Error during inference: {e}", flush=True)
             response = "ERROR DURING INFERENCE"
 
-        # Post-process to extract clean answer based on QA type
+        # === Post-processing ===
         if isinstance(response, str):
-            response_clean = response.strip().lower()
+            response = self._strip_noise(response)
+            response_clean = response.lower()
 
             if qa_type == "true_false":
                 if "true" in response_clean:
@@ -444,19 +516,19 @@ class ClinIQLinkSampleDatasetSubmit:
                     response = "false"
 
             elif qa_type == "multiple_choice":
-                # Extract single letter A–D
-                match = re.search(r"\b[a-d]\b", response_clean)
-                response = match.group() if match else response_clean
+                m = re.search(r"\b([A-D])\b", response)
+                response = m.group(1) if m else response  # keep capital letter only
 
             elif qa_type == "list":
-                # Return comma-separated list or split lines
-                response = ", ".join(re.findall(r"[a-zA-Z0-9\s\-]+", response_clean))
+                letters = self.CAP_LETTERS_RE.findall(response)
+                response = ", ".join(sorted(set(letters)))
+
 
             elif qa_type in {"short", "multi_hop", "short_inverse", "multi_hop_inverse"}:
-                # For open-ended questions, return the trimmed response directly
                 response = response_clean
 
         return response
+
 
     def submit_true_false_questions(self):
         """
