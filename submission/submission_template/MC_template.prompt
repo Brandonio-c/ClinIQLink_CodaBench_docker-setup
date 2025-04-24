@@ -1,4 +1,6 @@
-You are a highly knowledgeable medical expert. Answer the following multiple-choice question accurately by selecting the best option from the list below.
+You are a highly knowledgeable medical expert. Carefully answer the following multiple-choice question by selecting the single most appropriate answer from the list below.
+
+Respond with the **full text** of the best option, not the letter. Do not include option letters, explanations, or any extra text.
 
 Question:
 {question}
@@ -10,4 +12,4 @@ C: {options_C}
 D: {options_D}
 
 Expected response output format:
-A single letter (e.g., "A", "B", "C" or "D")
+The full text of the correct option

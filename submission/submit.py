@@ -43,9 +43,9 @@ class ClinIQLinkSampleDatasetSubmit:
         )
         self.CAP_LETTERS_RE = re.compile(r"\b[A-Z]\b")
 
-    def _strip_noise(text: str) -> str:
-        """remove leading blank lines + any trailing 'assistant' artefacts"""
-        return re.sub(r"\bassistant\b", "", text, flags=re.I).lstrip().rstrip()
+    def _strip_noise(self, text: str) -> str:
+        """Remove leading blank lines and stray 'assistant' artefacts."""
+        return re.sub(r"\bassistant\b", "", text, flags=re.I).strip()
 
     def load_participant_model(self):
         """
@@ -504,28 +504,11 @@ class ClinIQLinkSampleDatasetSubmit:
             print(f"Error during inference: {e}", flush=True)
             response = "ERROR DURING INFERENCE"
 
-        # === Post-processing ===
+        # === Post-processing (preserve full model response) ===
         if isinstance(response, str):
             response = self._strip_noise(response)
-            response_clean = response.lower()
-
-            if qa_type == "true_false":
-                if "true" in response_clean:
-                    response = "true"
-                elif "false" in response_clean:
-                    response = "false"
-
-            elif qa_type == "multiple_choice":
-                m = re.search(r"\b([A-D])\b", response)
-                response = m.group(1) if m else response  # keep capital letter only
-
-            elif qa_type == "list":
-                letters = self.CAP_LETTERS_RE.findall(response)
-                response = ", ".join(sorted(set(letters)))
-
-
-            elif qa_type in {"short", "multi_hop", "short_inverse", "multi_hop_inverse"}:
-                response = response_clean
+        elif isinstance(response, list):
+            response = [self._strip_noise(r) if isinstance(r, str) else r for r in response]
 
         return response
 

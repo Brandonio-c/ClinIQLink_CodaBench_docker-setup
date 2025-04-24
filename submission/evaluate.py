@@ -416,11 +416,11 @@ class ClinIQLinkSampleDatasetEvaluate:
                 predicted = self._to_text(pred).strip().lower()
                 expected = str(gold.get("answer", "")).strip().lower()
 
-                # Only accept valid binary classification values
-                if predicted in {"true", "false"}:
+                # Accept *only* the exact words "true" or "false"
+                if predicted == "true" or predicted == "false":
                     all_expected.append(expected)
                     all_predicted.append(predicted)
-                    score = 1.0 if expected == predicted else 0.0
+                    score = 1.0 if predicted == expected else 0.0
                 else:
                     all_expected.append(expected)
                     all_predicted.append("invalid")  # force a false match
@@ -488,36 +488,29 @@ class ClinIQLinkSampleDatasetEvaluate:
             raw_scores = []
 
             for gold, pred in zip(inputs, predictions):
-                predicted = self._to_text(pred).strip().upper()
+                predicted = self._to_text(pred).strip().lower()            
+                expected  = str(gold.get("correct_answer", "")).strip().lower()
                 options = gold.get("options", [])
-                expected_value = str(gold.get("correct_answer", "")).strip().lower()
-                
-                # Map option values to letters
-                letter_map = {chr(65 + i): opt.strip().lower() for i, opt in enumerate(options)}
-                value_to_letter = {v: k for k, v in letter_map.items()}
-                expected_letter = value_to_letter.get(expected_value, None)
 
-                score = 1.0 if predicted == expected_letter and predicted in letter_map else 0.0
+                score = 1.0 if predicted == expected else 0.0
                 raw_scores.append(score)
 
-                # F1 calculation inputs
-                all_expected.append(expected_letter if expected_letter else "invalid")
-                all_predicted.append(predicted if predicted in letter_map else "invalid")
+                all_expected.append(expected)
+                all_predicted.append(predicted)
 
                 para_id = gold.get("source", {}).get("paragraph_id", "unknown")
                 results[para_id] = {
                     "question": gold.get("question", ""),
-                    "expected": expected_letter,
+                    "expected": expected,
                     "predicted": predicted,
+                    "options": options,
                     "score": score,
                     "source": gold.get("source", {})
                 }
 
             # Compute macro precision/recall/f1 using label matching
-            label_list = list(letter_map.keys()) + ["invalid"]
             precision, recall, f1 = self.compute_classification_metrics(
-                all_expected, all_predicted,
-                average="micro", labels=label_list
+                all_expected, all_predicted, average="micro"
             )
             avg_score = sum(raw_scores) / len(raw_scores) if raw_scores else 0.0
 
@@ -534,7 +527,6 @@ class ClinIQLinkSampleDatasetEvaluate:
         except Exception as e:
             print(f"Error evaluating Multiple Choice questions: {e}", flush=True)
             return {"average": 0.0, "precision": 0.0, "recall": 0.0, "f1_score": 0.0, "scores": {}}
-
 
 
     def evaluate_list_questions(self):
@@ -567,29 +559,20 @@ class ClinIQLinkSampleDatasetEvaluate:
 
             for gold, raw_pred in zip(inputs, predictions):
                 try:
-                    options = gold.get("options", [])
-                    letter_to_option = {chr(65 + i): opt.strip().lower() for i, opt in enumerate(options)}
-                    option_to_letter = {v: k for k, v in letter_to_option.items()}
-                    valid_letters_set = set(letter_to_option.keys())
-
+                    options = [opt.strip().lower() for opt in gold.get("options", [])]
                     expected_values = [v.strip().lower() for v in gold.get("answer", [])]
-                    expected_letters = sorted(
-                        {option_to_letter[v] for v in expected_values if v in option_to_letter}
-                    )
 
-                    pred_text = self._to_text(raw_pred).strip().upper()
-                    predicted_letters = []
+                    # Model output → list of option texts
+                    pred_text = self._to_text(raw_pred).strip().lower()
+                    predicted_values = [p.strip() for p in pred_text.split(",") if p.strip()]
 
-                    if len(pred_text.split()) <= 10 and len(pred_text) <= 50:
-                        import re
-                        regex = r'\b[' + ''.join(valid_letters_set) + r']\b'
-                        predicted_letters = sorted(set(re.findall(regex, pred_text)))
+                    # Compute overlap metrics
+                    precision, recall, f1 = self.compute_overlap_f1(expected_values, predicted_values)
 
-                    precision, recall, f1 = self.compute_overlap_f1(expected_letters, predicted_letters)
-
-                    tp = len(set(expected_letters) & set(predicted_letters))
-                    fp = len(set(predicted_letters) - set(expected_letters))
-                    fn = len(set(expected_letters) - set(predicted_letters))
+                    # Global precision/recall counts
+                    tp = len(set(expected_values) & set(predicted_values))
+                    fp = len(set(predicted_values) - set(expected_values))
+                    fn = len(set(expected_values) - set(predicted_values))
                     global_tp += tp
                     global_fp += fp
                     global_fn += fn
@@ -597,19 +580,21 @@ class ClinIQLinkSampleDatasetEvaluate:
                     para_id = gold.get("source", {}).get("paragraph_id", "unknown")
                     results[para_id] = {
                         "question": gold.get("question", ""),
-                        "expected": expected_letters,
-                        "predicted": predicted_letters if predicted_letters else pred_text,
-                        "score": f1,
+                        "expected": expected_values,
+                        "predicted": predicted_values if predicted_values else pred_text,
+                        "options": options,
+                        "f1_score": f1,
                         "precision": precision,
                         "recall": recall,
                         "source": gold.get("source", {})
                     }
+
                     precision_list.append(precision)
                     recall_list.append(recall)
                     f1_list.append(f1)
-
                 except Exception as inner_e:
                     print(f"Error processing List QA: {inner_e}", flush=True)
+
 
             avg_precision = sum(precision_list) / len(precision_list) if precision_list else 0.0
             avg_recall = sum(recall_list) / len(recall_list) if recall_list else 0.0
