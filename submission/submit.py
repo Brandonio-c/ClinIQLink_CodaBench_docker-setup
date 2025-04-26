@@ -14,11 +14,12 @@ os.environ["TORCH_HOME"] = "/app/.cache/torch"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 class ClinIQLinkSampleDatasetSubmit:
-    def __init__(self, run_mode="container", max_length=1028, sample_sizes=None, random_sample=False):
+    def __init__(self, run_mode="container", max_length=1028, sample_sizes=None, random_sample=False, chunk_size=2):
         self.run_mode = run_mode.lower()
         self.max_length = max_length
         self.sample_sizes = sample_sizes or {}
         self.random_sample = random_sample
+        self.chunk_size = chunk_size
         # Base directories and setup depending on run mode
         if run_mode == "container":
             print("Running in container mode.", flush=True)
@@ -46,6 +47,48 @@ class ClinIQLinkSampleDatasetSubmit:
     def _strip_noise(self, text: str) -> str:
         """Remove leading blank lines and stray 'assistant' artefacts."""
         return re.sub(r"\bassistant\b", "", text, flags=re.I).strip()
+    
+    
+    def _batched_inference(self, prompts, qa_type):
+        """Run self.participant_model() on small chunks to avoid GPU OOM."""
+        responses = []
+        for i in range(0, len(prompts), self.chunk_size):
+            chunk = prompts[i : i + self.chunk_size]
+            out = self.participant_model(chunk if len(chunk) > 1 else chunk[0],
+                                        qa_type=qa_type)
+            # participant_model returns str for single prompt, list for many
+            if isinstance(out, list):
+                responses.extend(out)
+            else:
+                responses.append(out)
+        return responses
+    
+    def _bundle(self, inputs, responses, prompts=None):
+        """
+        Return a structure like:
+            {
+            "inputs":    [... QA dicts each augmented with 'response' (and 'prompt')],
+            "responses": [... model outputs ...],
+            "prompts":   [... optional prompts ...]
+            }
+        So the evaluator can access clean splits, but the QA dicts still carry the outputs.
+        """
+        bundled_inputs = []
+        for i, qa in enumerate(inputs):
+            item = qa.copy()                  # Copy QA fields
+            item["response"] = responses[i]   # Insert model output into QA dict
+            if prompts:
+                item["prompt"] = prompts[i]    # Insert prompt if given
+            bundled_inputs.append(item)
+
+        result = {
+            "inputs": bundled_inputs,
+            "responses": responses
+        }
+        if prompts:
+            result["prompts"] = prompts
+
+        return result
 
     def load_participant_model(self):
         """
@@ -219,7 +262,7 @@ class ClinIQLinkSampleDatasetSubmit:
                         "text-generation",
                         model=self.model,
                         tokenizer=self.tokenizer,
-                        batch_size=8,
+                        batch_size=self.chunk_size,
                         max_length=self.max_length,
                         truncation=True,
                         do_sample=False,             # Add this if using temperature/top_p
@@ -537,16 +580,12 @@ class ClinIQLinkSampleDatasetSubmit:
                     prompts.append("")
 
             try:
-                responses = self.participant_model(prompts, qa_type="true_false")
+                responses = self._batched_inference(prompts, qa_type="true_false")
             except Exception as e:
                 print(f"Error during model inference for TF QA: {e}", flush=True)
                 responses = ["ERROR"] * len(prompts)
 
-            return {
-                "responses": responses,
-                "inputs": tf_data,
-                "prompts": prompts
-            }
+            return self._bundle(tf_data, responses, prompts)
 
         except Exception as e:
             print(f"Error submitting True/False questions: {e}", flush=True)
@@ -578,16 +617,12 @@ class ClinIQLinkSampleDatasetSubmit:
                     prompts.append("")
 
             try:
-                responses = self.participant_model(prompts, qa_type="multiple_choice")
+                responses = self._batched_inference(prompts, qa_type="multiple_choice")
             except Exception as e:
                 print(f"Error during model inference for MC QA: {e}", flush=True)
                 responses = ["ERROR"] * len(prompts)
 
-            return {
-                "responses": responses,
-                "inputs": mc_data,
-                "prompts": prompts
-            }
+            return self._bundle(mc_data, responses, prompts)
 
         except Exception as e:
             print(f"Error submitting Multiple Choice questions: {e}", flush=True)
@@ -619,16 +654,12 @@ class ClinIQLinkSampleDatasetSubmit:
                     prompts.append("")
 
             try:
-                responses = self.participant_model(prompts, qa_type="list")
+                responses = self._batched_inference(prompts, qa_type="list")
             except Exception as e:
                 print(f"Error during model inference for List QA: {e}", flush=True)
                 responses = ["ERROR"] * len(prompts)
 
-            return {
-                "responses": responses,
-                "inputs": list_data,
-                "prompts": prompts
-            }
+            return self._bundle(list_data, responses, prompts)
 
         except Exception as e:
             print(f"Error submitting List questions: {e}", flush=True)
@@ -660,16 +691,12 @@ class ClinIQLinkSampleDatasetSubmit:
                     prompts.append("")
 
             try:
-                responses = self.participant_model(prompts, qa_type="short")
+                responses = self._batched_inference(prompts, qa_type="short")
             except Exception as e:
                 print(f"Error during model inference for Short QA: {e}", flush=True)
                 responses = ["ERROR"] * len(prompts)
 
-            return {
-                "responses": responses,
-                "inputs": short_data,
-                "prompts": prompts,
-            }
+            return self._bundle(short_data, responses, prompts)
 
         except Exception as e:
             print(f"Error submitting Short Answer questions: {e}", flush=True)
@@ -702,16 +729,12 @@ class ClinIQLinkSampleDatasetSubmit:
                     prompts.append("")
 
             try:
-                responses = self.participant_model(prompts, qa_type="short_inverse")
+                responses = self._batched_inference(prompts, qa_type="short_inverse")
             except Exception as e:
                 print(f"Error during model inference for Short Inverse QA: {e}", flush=True)
                 responses = ["ERROR"] * len(prompts)
 
-            return {
-                "responses": responses,
-                "inputs": short_inverse_data,
-                "prompts": prompts,
-            }
+            return self._bundle(short_inverse_data, responses, prompts)
 
         except Exception as e:
             print(f"Error submitting Short Inverse questions: {e}", flush=True)
@@ -743,16 +766,12 @@ class ClinIQLinkSampleDatasetSubmit:
                     prompts.append("")
 
             try:
-                responses = self.participant_model(prompts, qa_type="multi_hop")
+                responses = self._batched_inference(prompts, qa_type="multi_hop")
             except Exception as e:
                 print(f"Error during model inference for Multi-hop QA: {e}", flush=True)
                 responses = ["ERROR"] * len(prompts)
 
-            return {
-                "responses": responses,
-                "inputs": mh_data,
-                "prompts": prompts,
-            }
+            return self._bundle(mh_data, responses, prompts)
 
         except Exception as e:
             print(f"Error submitting Multi-hop questions: {e}", flush=True)
@@ -784,16 +803,12 @@ class ClinIQLinkSampleDatasetSubmit:
                     prompts.append("")
 
             try:
-                responses = self.participant_model(prompts, qa_type="multi_hop_inverse")
+                responses = self._batched_inference(prompts, qa_type="multi_hop_inverse")
             except Exception as e:
                 print(f"Error during model inference for Multi-hop Inverse QA: {e}", flush=True)
                 responses = ["ERROR"] * len(prompts)
 
-            return {
-                "responses": responses,
-                "inputs": mh_inverse_data,
-                "prompts": prompts,
-            }
+            return self._bundle(mh_inverse_data, responses, prompts)
 
         except Exception as e:
             print(f"Error submitting Multi-hop Inverse questions: {e}", flush=True)
@@ -856,7 +871,7 @@ def parse_args():
     parser.add_argument("--num_multi", type=int, default=200, help="Number of Multi-hop questions to evaluate")
     parser.add_argument("--num_multi_inv", type=int, default=200, help="Number of Multi-hop Inverse questions to evaluate")
     parser.add_argument("--random", action="store_true", help="If set, sample QA pairs randomly. Otherwise, take first N.")
-
+    parser.add_argument("--chunk_size", type=int, default=2, help="Chunk size for batching prompts during inference (default: 2)")
     
     return parser.parse_args()
 
@@ -871,5 +886,5 @@ if __name__ == "__main__":
         "num_multi": args.num_multi,
         "num_multi_inv": args.num_multi_inv,
     }
-    submit = ClinIQLinkSampleDatasetSubmit(run_mode=args.mode, max_length=args.max_length, sample_sizes=sample_sizes, random_sample=args.random)
+    submit = ClinIQLinkSampleDatasetSubmit(run_mode=args.mode, max_length=args.max_length, sample_sizes=sample_sizes, random_sample=args.random, chunk_size=args.chunk_size)
     submit.run_all_submissions()

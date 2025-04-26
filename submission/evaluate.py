@@ -493,8 +493,14 @@ class ClinIQLinkSampleDatasetEvaluate:
 
                     options = gold.get("options", {})
 
-                    # Map option full texts to their corresponding letters
+                    # Make sure options is a dict {A: "option1", B: "option2", ...}
+                    if isinstance(options, list):
+                        # Convert list to dict if needed
+                        options = {chr(65 + idx): opt for idx, opt in enumerate(options)}
+
+                    # Now map option texts to their corresponding letters
                     text_to_letter = {v.strip().lower(): k.upper() for k, v in options.items()}
+
 
                     predicted_letter = text_to_letter.get(predicted_text, "INVALID")
 
