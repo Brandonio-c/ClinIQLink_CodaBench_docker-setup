@@ -6,10 +6,10 @@ Question:
 {question}
 
 Options:
-A: {options_A}
-B: {options_B}
-C: {options_C}
-D: {options_D}
+{options_A}
+{options_B}
+{options_C}
+{options_D}
 
 Expected response output format:
 The full text of the correct option

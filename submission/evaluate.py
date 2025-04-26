@@ -466,8 +466,7 @@ class ClinIQLinkSampleDatasetEvaluate:
     def evaluate_multiple_choice_questions(self):
         """
         Evaluate all Multiple Choice questions using precision, recall, and F1.
-        Maps correct answer value to letter, compares against predicted letter.
-        Returns average accuracy, precision, recall, and F1, plus per-QA scores.
+        Maps model's predicted text back to letter, compares against expected letter.
         """
         try:
             blob = self.output_data.get("multiple_choice")
@@ -488,27 +487,38 @@ class ClinIQLinkSampleDatasetEvaluate:
             raw_scores = []
 
             for gold, pred in zip(inputs, predictions):
-                predicted = self._to_text(pred).strip().lower()            
-                expected  = str(gold.get("correct_answer", "")).strip().lower()
-                options = gold.get("options", [])
+                try:
+                    predicted_text = self._to_text(pred).strip().lower()
+                    expected_letter = str(gold.get("correct_answer", "")).strip().upper()
 
-                score = 1.0 if predicted == expected else 0.0
-                raw_scores.append(score)
+                    options = gold.get("options", {})
 
-                all_expected.append(expected)
-                all_predicted.append(predicted)
+                    # Map option full texts to their corresponding letters
+                    text_to_letter = {v.strip().lower(): k.upper() for k, v in options.items()}
 
-                para_id = gold.get("source", {}).get("paragraph_id", "unknown")
-                results[para_id] = {
-                    "question": gold.get("question", ""),
-                    "expected": expected,
-                    "predicted": predicted,
-                    "options": options,
-                    "score": score,
-                    "source": gold.get("source", {})
-                }
+                    predicted_letter = text_to_letter.get(predicted_text, "INVALID")
 
-            # Compute macro precision/recall/f1 using label matching
+                    # Score
+                    score = 1.0 if predicted_letter == expected_letter else 0.0
+                    raw_scores.append(score)
+
+                    all_expected.append(expected_letter)
+                    all_predicted.append(predicted_letter)
+
+                    para_id = gold.get("source", {}).get("paragraph_id", "unknown")
+                    results[para_id] = {
+                        "question": gold.get("question", ""),
+                        "expected": expected_letter,
+                        "predicted": predicted_letter,
+                        "predicted_text": predicted_text,
+                        "options": options,
+                        "score": score,
+                        "source": gold.get("source", {})
+                    }
+                except Exception as inner_e:
+                    print(f"Error evaluating multiple choice QA: {inner_e}", flush=True)
+
+            # Compute macro precision/recall/f1
             precision, recall, f1 = self.compute_classification_metrics(
                 all_expected, all_predicted, average="micro"
             )
@@ -527,6 +537,7 @@ class ClinIQLinkSampleDatasetEvaluate:
         except Exception as e:
             print(f"Error evaluating Multiple Choice questions: {e}", flush=True)
             return {"average": 0.0, "precision": 0.0, "recall": 0.0, "f1_score": 0.0, "scores": {}}
+
 
 
     def evaluate_list_questions(self):
