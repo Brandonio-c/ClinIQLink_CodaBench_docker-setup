@@ -513,13 +513,13 @@ class ClinIQLinkSampleDatasetSubmit:
                 eot_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
                 gen_cfg = GenerationConfig(
                         max_new_tokens = {
-                            "multiple_choice": 12,
-                            "list": 16,
-                            "true_false": 8,
-                            "short": 512,
-                            "short_inverse": 512,
-                            "multi_hop": 1024,
-                            "multi_hop_inverse": 1024,
+                            "multiple_choice": 1024,
+                            "list": 1024,
+                            "true_false": 1024,
+                            "short": 2048,
+                            "short_inverse": 2048,
+                            "multi_hop": 2048,
+                            "multi_hop_inverse": 2048,
                         }.get(qa_type, 32),
                         do_sample      = self.do_sample,
                         temperature    = self.temperature or 1.0 if self.do_sample else None,
