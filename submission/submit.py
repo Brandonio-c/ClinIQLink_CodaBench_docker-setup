@@ -14,12 +14,22 @@ os.environ["TORCH_HOME"] = "/app/.cache/torch"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 class ClinIQLinkSampleDatasetSubmit:
-    def __init__(self, run_mode="container", max_length=1028, sample_sizes=None, random_sample=False, chunk_size=2):
+    def __init__(self, run_mode="container", max_length=1028, sample_sizes=None, random_sample=False, chunk_size=2,
+                    do_sample=False, temperature=None, top_p=None, top_k=None):
         self.run_mode = run_mode.lower()
         self.max_length = max_length
         self.sample_sizes = sample_sizes or {}
         self.random_sample = random_sample
         self.chunk_size = chunk_size
+        self.do_sample = do_sample
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
+        if self.do_sample and (self.temperature is None or self.temperature <= 0):
+            print("[WARN] --do_sample was set but temperature <=0; "
+                "setting temperature=0.7 for safety.", flush=True)
+            self.temperature = 0.7
+            
         # Base directories and setup depending on run mode
         if run_mode == "container":
             print("Running in container mode.", flush=True)
@@ -260,14 +270,15 @@ class ClinIQLinkSampleDatasetSubmit:
                 try:
                     _pipeline = pipeline(
                         "text-generation",
-                        model=self.model,
-                        tokenizer=self.tokenizer,
-                        batch_size=self.chunk_size,
-                        max_length=self.max_length,
-                        truncation=True,
-                        do_sample=False,             # Add this if using temperature/top_p
-                        # temperature=0.7,            # Optional
-                        # top_p=0.9                   # Optional
+                        model      = self.model,
+                        tokenizer  = self.tokenizer,
+                        batch_size = self.chunk_size,
+                        max_length = self.max_length,
+                        truncation = True,
+                        do_sample  = self.do_sample,
+                        temperature= self.temperature,
+                        top_p      = self.top_p,
+                        top_k      = self.top_k,
                     )
 
                     # Safely set pad_token if missing
@@ -510,10 +521,13 @@ class ClinIQLinkSampleDatasetSubmit:
                             "multi_hop": 1024,
                             "multi_hop_inverse": 1024,
                         }.get(qa_type, 32),
-                        temperature = 0.0,
-                        top_p = 1.0,
-                        eos_token_id = eot_id,
-                        pad_token_id = self.tokenizer.eos_token_id,
+                        do_sample      = self.do_sample,
+                        temperature    = self.temperature or 1.0 if self.do_sample else None,
+                        top_p          = self.top_p,
+                        top_k          = self.top_k,
+                        top_n_tokens   = None,        # keep defaults
+                        eos_token_id   = eot_id,
+                        pad_token_id   = self.tokenizer.eos_token_id,
                     )
 
                 output_ids = self.model.generate(inputs, generation_config=gen_cfg)
@@ -872,6 +886,17 @@ def parse_args():
     parser.add_argument("--num_multi_inv", type=int, default=200, help="Number of Multi-hop Inverse questions to evaluate")
     parser.add_argument("--random", action="store_true", help="If set, sample QA pairs randomly. Otherwise, take first N.")
     parser.add_argument("--chunk_size", type=int, default=2, help="Chunk size for batching prompts during inference (default: 2)")
+    # ------------------------------------------------------------------
+    # generation-control flags   (all optional; sensible defaults below)
+    # ------------------------------------------------------------------
+    parser.add_argument("--do_sample",   action="store_true",
+                        help="Enable stochastic sampling (default off → greedy)")
+    parser.add_argument("--temperature", type=float, default=None,
+                        help="Sampling temperature (>0). Ignored if --do_sample is not set")
+    parser.add_argument("--top_p",       type=float, default=None,
+                        help="Nucleus-sampling top-p (0‒1)")
+    parser.add_argument("--top_k",       type=int,   default=None,
+                        help="Top-k sampling (integer)")
     
     return parser.parse_args()
 
@@ -886,5 +911,16 @@ if __name__ == "__main__":
         "num_multi": args.num_multi,
         "num_multi_inv": args.num_multi_inv,
     }
-    submit = ClinIQLinkSampleDatasetSubmit(run_mode=args.mode, max_length=args.max_length, sample_sizes=sample_sizes, random_sample=args.random, chunk_size=args.chunk_size)
+
+    submit = ClinIQLinkSampleDatasetSubmit(
+        run_mode      = args.mode,
+        max_length    = args.max_length,
+        sample_sizes  = sample_sizes,
+        random_sample = args.random,
+        chunk_size    = args.chunk_size,
+        do_sample   = args.do_sample,
+        temperature = args.temperature,
+        top_p       = args.top_p,
+        top_k       = args.top_k,
+    )
     submit.run_all_submissions()
