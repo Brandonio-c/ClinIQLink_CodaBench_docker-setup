@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import numpy as np
 import argparse
 from sklearn.metrics import precision_score, recall_score, f1_score
@@ -465,9 +466,15 @@ class ClinIQLinkSampleDatasetEvaluate:
 
     def evaluate_multiple_choice_questions(self):
         """
-        Evaluate all Multiple Choice questions using precision, recall, and F1.
-        Maps model's predicted text back to letter, compares against expected letter.
+        Evaluate Multiple Choice questions by normalizing and comparing text-to-text.
+        Returns average score, precision, recall, F1, and per-question results.
         """
+
+        def normalise(text: str) -> str:
+            """Lowercase, strip, collapse whitespace, remove most punctuation."""
+            text = re.sub(r"[^\w\s%]", "", text.lower())
+            return re.sub(r"\s+", " ", text).strip()
+
         try:
             blob = self.output_data.get("multiple_choice")
             if not blob:
@@ -488,35 +495,32 @@ class ClinIQLinkSampleDatasetEvaluate:
 
             for gold, pred in zip(inputs, predictions):
                 try:
-                    predicted_text = self._to_text(pred).strip().lower()
-                    expected_letter = str(gold.get("correct_answer", "")).strip().upper()
-
                     options = gold.get("options", {})
-
-                    # Make sure options is a dict {A: "option1", B: "option2", ...}
                     if isinstance(options, list):
-                        # Convert list to dict if needed
                         options = {chr(65 + idx): opt for idx, opt in enumerate(options)}
 
-                    # Now map option texts to their corresponding letters
-                    text_to_letter = {v.strip().lower(): k.upper() for k, v in options.items()}
+                    # Handle whether correct_answer is a letter ("B") or full text
+                    correct_raw = str(gold.get("correct_answer", "")).strip()
+                    if len(correct_raw) == 1 and correct_raw.upper() in options:
+                        expected_orig = options[correct_raw.upper()]
+                    else:
+                        expected_orig = correct_raw
 
+                    expected_text = normalise(expected_orig)
+                    predicted_text = normalise(self._to_text(pred))
 
-                    predicted_letter = text_to_letter.get(predicted_text, "INVALID")
-
-                    # Score
-                    score = 1.0 if predicted_letter == expected_letter else 0.0
+                    score = 1.0 if predicted_text == expected_text else 0.0
                     raw_scores.append(score)
 
-                    all_expected.append(expected_letter)
-                    all_predicted.append(predicted_letter)
+                    all_expected.append(expected_text)
+                    all_predicted.append(predicted_text)
 
                     para_id = gold.get("source", {}).get("paragraph_id", "unknown")
                     results[para_id] = {
                         "question": gold.get("question", ""),
-                        "expected": expected_letter,
-                        "predicted": predicted_letter,
-                        "predicted_text": predicted_text,
+                        "expected": expected_orig,           # raw human-readable expected text
+                        "predicted": self._to_text(pred),     # raw model output
+                        "predicted_text": self._to_text(pred),
                         "options": options,
                         "score": score,
                         "source": gold.get("source", {})
@@ -524,11 +528,15 @@ class ClinIQLinkSampleDatasetEvaluate:
                 except Exception as inner_e:
                     print(f"Error evaluating multiple choice QA: {inner_e}", flush=True)
 
-            # Compute macro precision/recall/f1
-            precision, recall, f1 = self.compute_classification_metrics(
-                all_expected, all_predicted, average="micro"
-            )
             avg_score = sum(raw_scores) / len(raw_scores) if raw_scores else 0.0
+
+            # Binary labels for precision/recall/F1
+            all_expected_bin = [1 for _ in all_expected]  # All expected = 1
+            all_predicted_bin = [1 if p == e else 0 for p, e in zip(all_predicted, all_expected)]
+
+            precision, recall, f1 = self.compute_classification_metrics(
+                all_expected_bin, all_predicted_bin, average="binary"
+            )
 
             print(f"Multiple Choice Precision: {precision:.2f}, Recall: {recall:.2f}, F1: {f1:.2f}", flush=True)
 
