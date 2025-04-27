@@ -40,4 +40,4 @@ These files are automatically loaded and sampled during the evaluation process.
 
 For further guidance, please refer to the official documentation:
 
-[https://brandonio-c.github.io/ClinIQLink-2025/](https://brandonio-c.github.io/ClinIQLink-2025/)
+[https://cliniqlink.org](https://cliniqlink.org)

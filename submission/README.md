@@ -7,8 +7,8 @@ This directory provides an example of a correctly formatted submission for **Cli
 ```
 sample_submission/
 ├── submit.py                   # Main submission script (participants modify this)
-├── submit_GPT-2_example.py      # Example implementation using GPT-2
-├── submit.sh                    # SLURM submission script for HPC environments
+├── evaluate.py                 # runs the evaluations 
+├── entrypoint.sh               # entrypoint for the container
 ├── README.md                    # This document
 ├── submission_template/          # Blank template for participants
 │   ├── MC_template.prompt
@@ -24,14 +24,14 @@ sample_submission/
 ## How to Use
 
 ### 1. Modify `submit.py`
-Participants should modify `submit.py` to implement their model. The script should:
+Participants CAN but ARE NOT REQUIRED TO modify `submit.py` to implement their model. The script should:
 
 - Load and initialize the selected LLM.
 - Process the provided QA datasets.
 - Generate responses following the expected format.
 - Output results as a JSON file.
 
-#### Specifically, the following functions must be updated:
+#### Specifically, the following functions can be updated if required:
 
 - **`load_participant_model(self)`**  
   - Implement loading of the chosen LLM model locally
@@ -39,27 +39,12 @@ Participants should modify `submit.py` to implement their model. The script shou
 - **`load_participant_pipeline(self)`**  
   - Initialize the LLM inference pipeline.
 
-- **`YOUR_LLM_PLACEHOLDER(self, prompt)`** *(or rename for another model)*  
-  - Update this function to call the loaded model and return generated text.
-
 ### 2. Run Locally
 Before submitting, test the script locally by running:
 
 ```bash
-python submit.py --mode local --max_length 200 --num_tf 1 --num_mc 1 --num_list 1 --num_short 1 --num_short_inv 1 --num_multi 1 --num_multi_inv 1
+python submit.py --mode local --chunk_size 4 --max_length 200 --num_tf 1 --num_mc 1 --num_list 1 --num_short 1 --num_short_inv 1 --num_multi 1 --num_multi_inv 1
 ```
-
-### 3. Using GPT-2 (Example)
-An example implementation using GPT-2 is provided in `submit_GPT-2_example.py`. This serves as a reference for setting up a model and generating responses.
-
-### 4. Submit to SLURM HPC
-If running on an HPC cluster, use the provided SLURM job submission script:
-
-```bash
-sbatch submit.sh
-```
-
-The `submit.sh` script should be modified to match the specific requirements of the computing environment.
 
 ## Submission Template
 
@@ -88,7 +73,7 @@ A valid submission should:
 
 - The `submission_template/` folder provides an outline for expected submissions.
 - You cannot use an external API for an LLM. 
-- More information is available on the ClinIQLink challenge page on using outcall requests to do things like retrieving information on the question for RAG etc. see: https://brandonio-c.github.io/ClinIQLink-2025/
+- More information is available on the ClinIQLink challenge page on using outcall requests to do things like retrieving information on the question for RAG etc. see: [cliniqlink.org](https://cliniqlink.org)
 - If running a local model, make sure all dependencies are installed and configured correctly.
 
 For further details, refer to the **main repository README.md**.
