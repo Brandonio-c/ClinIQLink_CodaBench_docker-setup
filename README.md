@@ -4,7 +4,7 @@ This repository provides the complete evaluation environment for participants in
 
 ## Challenge Information
 
-- **Main Website**: https://brandonio-c.github.io/ClinIQLink-2025/
+- **Main Website**: https://cliniqlink.org/
 - **CodaBench Competition**: https://www.codabench.org/competitions/5117/
 - **Official Docker Image**: [`brandonioc/cliniqlink-image`](https://hub.docker.com/r/brandonioc/cliniqlink-image)
 - **Sample Dataset**: https://github.com/Brandonio-c/ClinIQLink_Sample-dataset
