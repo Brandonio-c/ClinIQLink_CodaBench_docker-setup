@@ -1,9 +1,9 @@
 [
     {
-        "answer": "The human spine consists of 6 cervical, 11 thoracic, 4 lumbar, 5 sacral, and 3 coccygeal vertebrae.",
-        "false_answer": "The human spine consists of 6 cervical, 11 thoracic, 4 lumbar, 5 sacral, and 3 coccygeal vertebrae.",
-        "incorrect_explanation": "The given answer contains several inaccuracies compared to the actual composition described in the paragraph. Specifically, there are actually 7 cervical, 12 thoracic, 5 lumbar, and the rest correctly identified. Therefore, the correct answer should reflect these accurate counts.",
-        "question": "What types and numbers of vertebrae make up the human spine?",
+        "question": "What effect does decreased calcium level within acinar cells typically have on trypsin?",
+        "answer": "Decreased calcium levels favor trypsin autoactivation.",
+        "false_answer": "Decreased calcium levels favor trypsin autoactivation.",
+        "incorrect_explanation": "when calcium levels are low, trypsin tends to cleave and inactivate itself; thus, decreased calcium actually inhibits rather than favors trypsin autoactivation. The correct statement would be that high calcium levels favor trypsin autoactivation because they prevent trypsin's ability to cleave and inactivate itself.",
         "source": {
             "isbn": "000-0000000000",
             "page": 0,
@@ -12,10 +12,10 @@
         "type": "short_inverse"
     },
     {
-        "answer": "The highest thoracic dermatome on the posterior back is primarily T2.",
-        "false_answer": "The highest thoracic dermatome on the posterior back is primarily T2.",
-        "incorrect_explanation": "The statement incorrectly places the primary coverage of the T2 dermatome on the posterior back instead of mentioning its extension into the upper limb and presence on the anterior chest wall, indicating confusion between anatomical locations described in the passage.",
-        "question": "What is the primary area covered by the dermatome associated with the second thoracic spinal nerve?",
+        "question": "What dosage of vasopressin is recommended for children aged between 5 to 12 years old who experience variceal bleeding?",
+        "answer": "0.05 units per minute",
+        "false_answer": "0.05 units per minute",
+        "incorrect_explanation": "the actual dose of vasopressin recommended for children aged 5 to 12 years old experiencing variceal bleeding is 0.3 units per minute, not 0.05 units per minute.",
         "source": {
             "isbn": "000-0000000000",
             "page": 0,
@@ -24,10 +24,10 @@
         "type": "short_inverse"
     },
     {
-        "answer": "Lumbar vertebrae are smaller compared to cervical and thoracic vertebrae.",
-        "false_answer": "Lumbar vertebrae being smaller than cervical and thoracic vertebrae.",
-        "incorrect_explanation": "Lumbar vertebrae are described as 'much larger than any other vertebrae in any other region.' Therefore, the statement claiming they are smaller is a contradiction of the given facts. The correct distinction lies in their significant size relative to vertebrae found elsewhere along the vertebral column",
-        "question": "What distinguishes lumbar vertebrae from cervical and thoracic vertebrae?",
+        "question": "What proportion of children visiting emergency departments for minor head injuries actually end up needing neurosurgical intervention?",
+        "answer": "Approximately 2% of children with minor head injuries require neurosurgical intervention.",
+        "false_answer": "Approximately 2% of children with minor head injuries require neurosurgical intervention.",
+        "incorrect_explanation": "among children with minor head injuries (MHI), it's estimated that less than 5% have intracranial injury, and less than 1% of those with intracranial injury require neurosurgical intervention. Therefore, the actual rate of children with MHI needing neurosurgical intervention is significantly lower than 2%, closer to less than 1%.",
         "source": {
             "isbn": "000-0000000000",
             "page": 0,
@@ -36,10 +36,10 @@
         "type": "short_inverse"
     },
     {
-        "answer": "The testicular artery passes through these two anatomical landmarks.",
-        "false_answer": "The testicular artery passes through both the deep and superficial inguinal rings.",
-        "incorrect_explanation": "While the statement seems accurate at first glance because it involves key components associated with male anatomy near the groin area, specifically mentioning passage through significant anatomical points, the actual contents passing through the deep and superficial inguinal rings involve more comprehensive elements. Specifically, the spermatic cord contains various structures, including arteries, nerves, and lymphatics, which indeed traverse these regions. Thus, stating merely that \"the testicular artery passes through these two anatomical landmarks\" simplifies what actually goes through them; rather, the entire spermatic cord does, encompassing multiple components including but not limited to the testicular artery. Therefore, the most straightforward correction would acknowledge this broader composition correctly moving past these areas, emphasizing the involvement of the whole spermatic cord instead of isolating one component within it.",
-        "question": "What structures pass through both the deep and superficial inguinal rings?",
+        "question": "What condition results when an individual's eye is too long relative to its focusing power?",
+        "answer": "Hyperopia",
+        "false_answer": "Hyperopia",
+        "incorrect_explanation": "hyperopia actually refers to a condition resulting from an eye being too short for its focusing power, leading to difficulty seeing nearby objects clearly because images focus behind the retina. The correct term for the condition described by having an eye too long relative to its focusing power is myopia, which causes close objects to be seen clearly but makes distant objects appear blurry since those images focus in front of the retina.",
         "source": {
             "isbn": "000-0000000000",
             "page": 0,
@@ -48,10 +48,10 @@
         "type": "short_inverse"
     },
     {
-        "answer": "The urethra penetrates vertically through the levator ani muscle when moving between these two areas.",
-        "false_answer": "The urethra penetrates vertically through the levator ani muscle.",
-        "incorrect_explanation": "The urethra actually penetrates through a circular hiatus in the perineal membrane, not the levator ani muscle, as it moves from the pelvic cavity to the perineum. Therefore, the correct answer should involve the perineal membrane, specifically mentioning the circular hiatus within it.",
-        "question": "What structures does the urethra penetrate vertically through when passing from the pelvic cavity to the perineum?",
+        "question": "How does Varicella-Zoster Virus typically transmit among individuals?",
+        "answer": "Varicella-Zoster Virus is primarily spread through contact with open wounds.",
+        "false_answer": "Varicella-Zoster Virus is primarily spread through contact with open wounds.",
+        "incorrect_explanation": "VZV transmission actually occurs \"by respiratory aerosols,\" indicating airborne transmission, not through contact with open wounds. Thus, the statement given is a misunderstanding of how VZV spreads between individuals.",
         "source": {
             "isbn": "000-0000000000",
             "page": 0,

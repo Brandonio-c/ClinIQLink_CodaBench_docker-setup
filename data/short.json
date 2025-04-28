@@ -1,7 +1,7 @@
 [
     {
-        "answer": "Their articulation with ribs.",
-        "question": "What characterizes the twelve thoracic vertebrae?",
+        "question": "What types of compounds do MATE1 and MATE2-K primarily interact with?",
+        "answer": "Structurally diverse hydrophilic organic cations, including certain drugs and zwitterions, plus some anions.",
         "source": {
             "isbn": "000-0000000000",
             "page": 0,
@@ -10,8 +10,8 @@
         "type": "short_answer"
     },
     {
-        "answer": "Heads of adjacent ribs; specifically, one with the head of its own rib via the superior costal facet, and another with the head of the rib below via the inferior costal facet.",
-        "question": "What do the two demifacets on a typical thoracic vertebra's body articulate with?",
+        "question": "What amount of protein excretion in the urine each day typically signifies significant renal disease?",
+        "answer": "Greater than 1 g/day of protein excretion is indicative of glomerular pathology.",
         "source": {
             "isbn": "000-0000000000",
             "page": 0,
@@ -20,8 +20,8 @@
         "type": "short_answer"
     },
     {
-        "answer": "Pubic symphysis, ischial tuberosities, and the sacrococcygeal region connected via the sacrotuberous ligament.",
-        "question": "What structures form the margin of the pelvic outlet?",
+        "question": "What condition is treated by blocking 5α-reductase?",
+        "answer": "Benign prostatic hyperplasia.",
         "source": {
             "isbn": "000-0000000000",
             "page": 0,
@@ -30,8 +30,8 @@
         "type": "short_answer"
     },
     {
-        "answer": "Subcostal nerve (T12), Iliohypogastric nerve (L1), Femoral nerve (L2-L4).",
-        "question": "What nerves arise from lumbar segments?",
+        "question": "What mechanism of action characterizes Selinexor?",
+        "answer": "It acts as a first-in-class exportin inhibitor blocking protein export from the cell nucleus.",
         "source": {
             "isbn": "000-0000000000",
             "page": 0,
@@ -40,8 +40,8 @@
         "type": "short_answer"
     },
     {
-        "answer": "Normal bone quality with deficient bone quantity.",
-        "question": "What characterizes osteoporosis?",
+        "question": "What is unique about how fibrinogen and VWF function during platelet activation?",
+        "answer": "Fibrinogen and/or VWF bridge adjacent platelets together inducing platelet aggregation.",
         "source": {
             "isbn": "000-0000000000",
             "page": 0,

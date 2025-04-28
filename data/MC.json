@@ -1,13 +1,13 @@
 [
     {
-        "correct_answer": "B",
-        "options": {
-            "A": "Right gastric artery",
-            "B": "Splenic artery proper",
-            "C": "Left gastroepiploic artery",
-            "D": "Superior mesenteric artery"
-        },
-        "question": "What artery primarily supplies blood to the spleen?",
+        "question": "What percentage range of mortality rates is reported for Crimean-Congo Hemorrhagic Fever?",
+        "correct_answer": "3% - 30%",
+        "options": [
+            "10% - 40%",
+            "3% - 80%",
+            "3% - 30%",
+            "15% - 70%"
+        ],
         "source": {
             "isbn": "000-0000000000",
             "page": 0,
@@ -16,14 +16,14 @@
         "type": "multiple_choice"
     },
     {
-        "correct_answer": "C",
-        "options": {
-            "A": "Referred numbness from the skin to internal organs.",
-            "B": "Pain perception remains localized to its true source regardless of neural pathways.",
-            "C": "Sensation from areas of low sensory output is misinterpreted as originating from areas of higher sensory output.",
-            "D": "Motor functions become involuntary in regions affected by referred sensations."
-        },
-        "question": "What happens when the signals from both the visceral and somatic sensory neurons converge at the same spinal cord level?",
+        "question": "What amount of 3% NaCl solution is typically administered per kilogram of body weight for rapid correction of hyponatremia in pediatric status epilepticus?",
+        "correct_answer": "4 to 6 mL/kg",
+        "options": [
+            "8 to 10 mL/kg",
+            "4 to 6 mL/kg",
+            "2 to 3 mL/kg",
+            "1 to 2 mL/kg"
+        ],
         "source": {
             "isbn": "000-0000000000",
             "page": 0,
@@ -32,14 +32,14 @@
         "type": "multiple_choice"
     },
     {
-        "correct_answer": "A",
-        "options": {
-            "A": "Thoracic, Lumbar, Sacral, Pelvic",
-            "B": "Only Thoracic splanchnic nerves exist",
-            "C": "Just Lumbar and Sacral splanchnic nerves",
-            "D": "Both Cranial and Spinal splanchnic nerves"
-        },
-        "question": "What levels of the spinal column give their names to the sets of splanchnic nerves that travel on each side of the vertebral column?",
+        "question": "What is the primary determinant of the degree of risk to the fetus when considering medical imaging involving ionizing radiation?",
+        "correct_answer": "Quantity of Ionizing Radiation Exposure",
+        "options": [
+            "Gestational Age",
+            "Quantity of Ionizing Radiation Exposure",
+            "Type of Imaging Study Ordered",
+            "Previous Medical History"
+        ],
         "source": {
             "isbn": "000-0000000000",
             "page": 0,
@@ -48,14 +48,14 @@
         "type": "multiple_choice"
     },
     {
-        "correct_answer": "C",
-        "options": {
-            "A": "Levels L3-L5",
-            "B": "Levels T10-T12",
-            "C": "Levels S2-S4",
-            "D": "Levels C6-C8"
-        },
-        "question": "At what level of the spine do spinal nerves form the pudendal nerve?",
+        "question": "What happens when verapamil and simvastatin are used together?",
+        "correct_answer": "Toxicity from simvastatin is increased due to competition for the same metabolic pathway involving cytochrome-P450 isoform 3A4.",
+        "options": [
+            "Simvastatin's effectiveness decreases significantly while verapamil remains unaffected.",
+            "Both verapamil and simvastatin become less potent.",
+            "Toxicity from simvastatin is decreased because verapamil accelerates its metabolism.",
+            "Toxicity from simvastatin is increased due to competition for the same metabolic pathway involving cytochrome-P450 isoform 3A4."
+        ],
         "source": {
             "isbn": "000-0000000000",
             "page": 0,
@@ -64,14 +64,14 @@
         "type": "multiple_choice"
     },
     {
-        "correct_answer": "D",
-        "options": {
-            "A": "Spinal cord level S3 to S5",
-            "B": "Spinal cord level L2 to S2",
-            "C": "Spinal cord level S2 to S4",
-            "D": "Spinal cord level L1"
-        },
-        "question": "What level of the spinal nerves supplies the dermatome that primarily maps the anterior regions of the perineum?",
+        "question": "What is typically involved in managing neonates with congenital diaphragmatic hernia after birth?",
+        "correct_answer": "Intubation, muscle relaxation, and gentle ventilation aiming to maintain pH and oxygen saturation",
+        "options": [
+            "Immediate surgical repair followed by aggressive ventilation",
+            "Intubation, muscle relaxation, and gentle ventilation aiming to maintain pH and oxygen saturation",
+            "Urgent reduction of the bowel to improve gas exchange",
+            "Extracorporeal life support immediately upon diagnosis"
+        ],
         "source": {
             "isbn": "000-0000000000",
             "page": 0,

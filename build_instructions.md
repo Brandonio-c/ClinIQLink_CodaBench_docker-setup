@@ -50,7 +50,7 @@ ClinIQLink_CodaBench_docker-setup/
 
 2. Inside the `submission/` folder, run:
    ```bash
-   python submit.py --mode local --chunk_size 4 --max_length 200 --num_tf 1 --num_mc 1 --num_list 1 --num_short 1 --num_short_inv 1 --num_multi 1 --num_multi_inv 1
+   python submit.py --mode local --chunk_size 4 --max_length 200 --num_tf 5 --num_mc 5 --num_list 5 --num_short 5 --num_short_inv 5 --num_multi 5 --num_multi_inv 5
    ```
 
 3. and once you have the forward inference results, then run the following for evaluation: 

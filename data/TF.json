@@ -1,7 +1,7 @@
 [
     {
+        "question": "Astrocytes are capable of transporting substances between the blood and neurons.",
         "answer": "False",
-        "question": "There are lymphatic vessels present in the visceral pleura.",
         "source": {
             "isbn": "000-0000000000",
             "page": 0,
@@ -10,8 +10,8 @@
         "type": "true_false"
     },
     {
-        "answer": "False",
-        "question": "Renal cell carcinomas originate from the distal tubules of the nephron.",
+        "question": "Fetal heart tones can typically be heard with a fetal stethoscope between 16 and 19 weeks of gestation.",
+        "answer": "True",
         "source": {
             "isbn": "000-0000000000",
             "page": 0,

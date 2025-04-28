@@ -1,23 +1,20 @@
 [
     {
+        "question": "What distinct apolipoproteins play roles during the process of forming and metabolizing chylomicrons?",
         "answer": [
-            "Trapezius",
-            "Latissimus dorsi",
-            "Rhomboid minor",
-            "Rhomboid major",
-            "Levator scapulae"
+            "Apo B-48",
+            "Apo E",
+            "Apo C"
         ],
         "options": [
-            "Trapezius",
-            "Latissimus dorsi",
-            "Rhomboid minor",
-            "Levator scapulae",
-            "Deltoids",
-            "Biceps brachii",
-            "Triceps brachii",
-            "Rhomboid major"
+            "Apo B-100",
+            "Apo B-48",
+            "Apo C",
+            "Apo C-III",
+            "Apo C-I",
+            "Apo E",
+            "Apo C-II"
         ],
-        "question": "What are all the names of superficial and deeper muscles located in the back?",
         "source": {
             "isbn": "000-0000000000",
             "page": 0,
@@ -26,36 +23,57 @@
         "type": "list"
     },
     {
+    
+        "question": "What are the distinct anatomical regions identified for the human head?",
         "answer": [
-            "Right recurrent laryngeal nerve",
-            "Right subclavian artery",
-            "Trachea",
-            "Esophagus",
-            "Superior vena cava",
-            "Right main bronchus",
-            "Cardiac plexus",
-            "Pulmonary plexus",
-            "Esophageal plexus"
-            ],
-        "options": [
-            "Right recurrent laryngeal nerve",
-            "Right subclavian artery",
-            "Trachea",
-            "Esophagus",
-            "Superior vena cava",
-            "Right main bronchus",
-            "Cardiac plexus",
-            "Pulmonary plexus",
-            "Esophageal plexus",
-            "Diaphragm",
-            "Azygos vein",
-            "Brachiocephalic trunk",
-            "Posterior vagal trunk",
-            "Phrenic nerve",
-            "Left vagus nerve",
-            "Thoracic duct"
+            "Frontal Region",
+            "Occipital Region",
+            "Temporal Region",
+            "Mastoid Region",
+            "Auricular Region",
+            "Nasolabial Fold Region",
+            "Mental Region",
+            "Zygomatic Region",
+            "Parietal Region"
         ],
-        "question": "What structures does the right vagus nerve pass near or give branches to?",
+        "options": [
+            "Intermaxillary Space Region",
+            "Maxillary Region",
+            "Frontal Region",
+            "Zygomatic Region",
+            "Paravertebral Region",
+            "Inferior Meatus Region",
+            "Sphenoidal Region",
+            "Infrazygomatic Crest Region",
+            "Thyroid Cartilage Region",
+            "Vomer Bone Region",
+            "Craniocervical Junction Region",
+            "Nasolabial Fold Region",
+            "Middle Turbinate Region",
+            "Lateral Rectus Muscles Region",
+            "Oropharynx Region",
+            "Auricular Region",
+            "Temporal Region",
+            "Digastric Fossa Region",
+            "Mental Region",
+            "Palatine Region",
+            "Masseter Muscle Region",
+            "Submandibular Gland Region",
+            "Cervical Region",
+            "Mandibular Region",
+            "Facial Nerve Exit Point Region",
+            "Parietal Region",
+            "Hyoid Apparatus Region",
+            "Medial Canthus Region",
+            "Superior Conchae Region",
+            "Sternomastoid Region",
+            "Lacrimal Region",
+            "Occipital Region",
+            "Mastoid Region",
+            "Ethmoidal Region",
+            "Hypopharyngeal Region",
+            "Supraorbital Foramen Region"
+        ],
         "source": {
             "isbn": "000-0000000000",
             "page": 0,
@@ -64,20 +82,16 @@
         "type": "list"
     },
     {
-        "question": "What are all the arteries involved in providing blood supply to the duodenum?",
+        "question": "What types of craniosynostosis result from the premature fusion of different parts of the cranium?",
         "answer": [
-            "Celiac trunk branches",
-            "Superior mesenteric artery branches"
+            "Sagittal synostosis",
+            "Coronal synostosis"
         ],
         "options": [
-            "Celiac trunk branches",
-            "Renal arteries",
-            "Inferior mesenteric artery branches",
-            "Common iliac arteries",
-            "Superior mesenteric artery branches",
-            "Splenic artery",
-            "Gonadal arteries",
-            "Lumbar arteries"
+            "Sagittal synostosis",
+            "Coronal synostosis",
+            "Lambdoid synostosis",
+            "Metopic synostosis"
         ],
         "source": {
             "isbn": "000-0000000000",
@@ -87,19 +101,24 @@
         "type": "list"
     },
     {
+        "question": "What types of diseases or conditions are specifically linked to Pulmonary Arterial Hypertension (PAH) in clinical contexts?",
         "answer": [
-            "Rectal plexus",
-            "Uterovaginal plexus",
-            "Prostatic plexus",
-            "Vesical plexus"
+            "Rheumatoid arthritis",
+            "Systemic lupus erythematosus",
+            "Systemic sclerosis",
+            "Limited cutaneous scleroderma",
+            "Diffuse scleroderma",
+            "Portopulmonary hypertension"
         ],
         "options": [
-            "Rectal plexus",
-            "Uterovaginal plexus",
-            "Prostatic plexus",
-            "Vesical plexus"
+            "Limited cutaneous scleroderma",
+            "Diffuse scleroderma",
+            "Systemic lupus erythematosus",
+            "Systemic sclerosis",
+            "Portopulmonary hypertension",
+            "Interstitial lung disease",
+            "Rheumatoid arthritis"
         ],
-        "question": "What are the subsidiary plexuses of the inferior hypogastric plexus? ",
         "source": {
             "isbn": "000-0000000000",
             "page": 0,
@@ -108,29 +127,29 @@
         "type": "list"
     },
     {
+        "question": "What types of surgeries are typically offered to different stages of pancreatic cancer?",
         "answer": [
-            "Superior gluteal nerve and vessel",
-            "Inferior gluteal nerves and vessels",
-            "Sciatic nerve",
-            "Posterior femoral cutaneous nerves",
-            "Pudendal nerve",
-            "Internal pudendal artery and vein",
-            "Nerve to quadratus femoris",
-            "Nerves to obturator internus muscle"
+            "Pylorus-preserving pancreatoduodenectomy (PPPD)",
+            "Pancreatic head resection through open approach",
+            "Laparoscopic distal pancreatectomy",
+            "Distal pancreatectomy with splenectomy",
+            "Neoadjuvant chemotherapy with/without chemoradiotherapy",
+            "Systemic chemotherapy"
         ],
         "options": [
-            "Superior gluteal nerve and vessel",
-            "Inferior gluteal nerves and vessels",
-            "Sciatic nerve",
-            "Posterior femoral cutaneous nerves",
-            "Pudendal nerve",
-            "Internal pudendal artery and vein",
-            "Nerve to quadratus femoris",
-            "Piriformis muscle",
-            "Obturator nerve and vessels",
-            "Greater trochanter"
+            "Laparoscopic distal pancreatectomy",
+            "Cholecystectomy during exploration phase",
+            "Local lymphadenectomy",
+            "Neoadjuvant chemotherapy with/without chemoradiotherapy",
+            "Systemic chemotherapy",
+            "Extended lymphadenectomy",
+            "Distal pancreatectomy with splenectomy",
+            "Pylorus-preserving pancreatoduodenectomy (PPPD)",
+            "Pancreatic head resection through open approach",
+            "Systemic chemotherapy combined with chemoradiation",
+            "Neoadjuvant chemotherapy alone",
+            "Splenectomy during distal pancreatectomy"
         ],
-        "question": "What are all the structures passing through the greater sciatic foramen?",
         "source": {
             "isbn": "000-0000000000",
             "page": 0,
