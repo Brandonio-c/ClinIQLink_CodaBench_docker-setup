@@ -1,8 +1,121 @@
+"""
+================================================================================
+    ClinIQLink - Comprehensive Evaluation Script
+================================================================================
+This module evaluates generated answers for **seven distinct clinical QA tasks**
+and produces both per-item results and aggregated analytics (JSON + plots).
+
+--------------------------------------------
+1.  Supported QA task files  (in `results_dir`)
+--------------------------------------------
+│  true_false.json          → yes / no judgement
+│  multiple_choice.json     → single-best option (A, B, …)
+│  list.json                → multi-select option list
+│  short.json               → short free-text answers
+│  multi_hop.json           → multi-sentence reasoning answers
+│  short_inverse.json       → explain *why* a short answer is wrong
+│  multi_hop_inverse.json   → find + explain an incorrect reasoning **step**
+└───────────────────────────────────────────────────────────────────────────────
+
+Each file must contain two top-level keys:  
+* `"inputs"`- list of ground-truth items  
+* `"responses"` - list of model outputs (same order & length)
+
+--------------------------------------------
+2.  Categorical tasks and their metrics
+--------------------------------------------
+• **True / False** - *Accuracy*  
+    `accuracy = #correct / N`
+
+• **Multiple-Choice** - *Accuracy* (after normalising punctuation/case)
+
+• **List (multi-select)** - token-level  **Macro & Micro F1**  
+    - Macro: mean F1 across questions  
+    - Micro: pool all TP/FP/FN, then F1
+
+--------------------------------------------
+3.  Open-ended tasks: custom semantic similarity
+--------------------------------------------
+Returned key: `"semantic_match_score"`  ∈ [0, 1]
+
+Step-by-step computation
+~~~~~~~~~~~~~~~~~~~~~~~~
+1. **Pre-cleaning** - strip stop-words & punctuation for all similarity layers.  
+2. **Exact-match guard** - if the raw (uncleaned) strings match ⇒ score 1.0.  
+3. **Three-layer cosine similarity**
+   * **Word-level** (weight 0.4)  
+        • WordPiece-tokenise both texts.  
+        • Look up an *IDF* for every token, built **once** from all reference
+        answers:  
+        `idf(tok) = log((N+1)/(df+1)) + 1`  
+        • Embed each token with SBERT and perform *greedy max alignment*  
+        to obtain an IDF-weighted precision/recall → F1.
+   * **Sentence-level** (weight 0.4)  
+        • Encode each full text with SBERT (`all-MiniLM-L6-v2`)  
+        and take the CLS vector.  
+        • `cosine(exp_vec, pred_vec)`.
+   * **Paragraph-level** (weight 0.2)  
+     • Same as sentence-level but on the **raw** strings.  
+        • Adjust for SBERT's baseline bias: a background sample of 100 random,
+       *unrelated* reference pairs is averaged once at start-up to yield
+        `para_baseline` (≈ 0.25-0.35).  
+        The raw cosine is mapped:  
+        `adj = (raw - baseline) / (1 - baseline)`  → clipped to ⩾0.
+4. **Weighted sum** → `semantic_score`.  
+5. **Bias clamp** - subtract the SBERT “unrelated” floor (~0.25).  
+6. **Cap** - if `semantic_score ≥ 0.95` set to **1.0**.
+
+*For **multi-hop-inverse** items the score is additionally penalised
+by how far the predicted “incorrect step #” is from the true one
+(distance 0→x1, 1→x0.7, 2→x0.3, ≥3 halves each further step).*
+
+
+--------------------------------------------
+4.  N-gram reference metrics (open-ended)
+--------------------------------------------
+For every open-ended answer we also compute:
+* **BLEU-1…4** (smooth-1) - reported as the cumulative BLEU (weights 0.25⁴).  
+* **METEOR** (NLTK ≥3.8, stemming + synonym matching via WordNet).  
+* **ROUGE-1/L** average F-measure.
+
+Aggregations:
+* Per-task **avg_bleu / avg_meteor / avg_rouge**  
+* Global average across the four open-ended tasks.
+
+--------------------------------------------
+5.  Visual analytics
+--------------------------------------------
+All plots are saved as **SVG** under `<evaluation_output>/plots/`:
+
+* Per-metric box, jitter & histogram (semantic, BLEU, METEOR, ROUGE).  
+* A combined dashboard (`all_metrics_dashboard.svg`) with one row
+    per metric x three columns (box | jitter | hist).
+
+--------------------------------------------
+6.  Command-line usage
+--------------------------------------------
+python evaluate.py \
+        --mode container \          # or 'local'
+        --results_dir submission_output \
+        --bin_width 0.05            # histogram bin width
+
+Dependencies
+
+Python ≥3.10, numpy <2, scikit-learn, sentence-transformers, torch,
+nltk, rouge-score, matplotlib (SVG backend), scipy, transformers,
+plus the usual tokenizer/sentencepiece extras.
+
+"""
+
 import json
 import os
 import re
 import numpy as np
 import argparse
+import random
+import matplotlib.pyplot as plt
+plt.rcParams['savefig.format'] = 'svg'
+import scipy.stats as stats
 from sklearn.metrics import precision_score, recall_score, f1_score
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
@@ -10,6 +123,7 @@ from nltk.tokenize import word_tokenize
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from nltk.translate.meteor_score import meteor_score
 from rouge_score import rouge_scorer
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 
 # Explicitly set HuggingFace & Torch cache paths for consistency and safety inside container
@@ -19,6 +133,12 @@ os.environ["TORCH_HOME"] = "/app/.cache/torch"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 import nltk
+
+from collections import Counter
+from transformers import AutoTokenizer
+from nltk.corpus import stopwords
+import string
+
 
 # Ensure NLTK uses the global path set via Docker ENV
 nltk.data.path.append(os.environ.get("NLTK_DATA", "/usr/local/nltk_data"))
@@ -33,9 +153,10 @@ except LookupError:
     print("Downloading 'punkt' tokenizer...")
 
 class ClinIQLinkSampleDatasetEvaluate:
-    def __init__(self, run_mode="container", results_dir="submission_output"):
+    def __init__(self, run_mode="container", results_dir="submission_output", bin_width=0.05):
         self.run_mode = run_mode.lower()
         self.results_dir = results_dir
+        self.bin_width  = bin_width
         # Base directories and setup depending on run mode
         if run_mode == "container":
             print("Running in container mode.", flush=True)
@@ -86,6 +207,59 @@ class ClinIQLinkSampleDatasetEvaluate:
         }
 
         self.output_data = self._load_outputs()
+
+        # — stop-word / punctuation setup —
+        try:
+            self._STOP_WORDS = set(stopwords.words("english"))
+        except LookupError:
+            nltk.download("stopwords", quiet=True)
+            self._STOP_WORDS = set(stopwords.words("english"))
+        self._PUNCT = set(string.punctuation)
+
+        all_refs = []
+        for blob in self.output_data.values():
+            if blob and "inputs" in blob:
+                for inp in blob["inputs"]:
+                    ans = inp.get("answer", "")
+                    if isinstance(ans, list):
+                        ans = " ".join(ans)
+                    if ans:
+                        all_refs.append(ans)
+        
+        
+        # ── build IDF from SBERT’s own WordPiece tokenizer ──
+        # collect all the raw reference texts first
+        refs = all_refs.copy()
+
+        # initialize tokenizer & empty DF counts
+        self.tokenizer   = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+        self._doc_freq   = Counter()
+        self._total_docs = 0
+
+        # count document frequency per WordPiece token
+        for ref in refs:
+            toks = set(self.tokenizer.tokenize(ref))
+            self._doc_freq.update(toks)
+            self._total_docs += 1
+
+        # precompute IDF: idf = log((N+1)/(df+1)) + 1
+        self._idf_scores = {
+            tok: np.log((self._total_docs + 1) / (df + 1)) + 1.0
+            for tok, df in self._doc_freq.items()
+        }
+
+        # ── estimate SBERT “unrelated” paragraph baseline ──
+        if len(refs) >= 100:
+            sample = random.sample(refs, 100)
+            sims = []
+            for a, b in zip(sample[:50], sample[50:]):
+                ea = self.st_model.encode(a, convert_to_tensor=True).cpu().numpy()
+                eb = self.st_model.encode(b, convert_to_tensor=True).cpu().numpy()
+                sims.append(cosine_similarity([ea], [eb])[0,0])
+            self.para_baseline = float(sum(sims) / len(sims))
+        else:
+            # fallback if too few refs
+            self.para_baseline = 0.3
 
     def load_json(self, filepath):
         """
@@ -158,7 +332,35 @@ class ClinIQLinkSampleDatasetEvaluate:
         return self.compute_classification_metrics(
             y_true, y_pred, average="binary", labels=[0,1]
         )
+    
+    def _extract_numbers(self, text: str):
+        """Find all numeric literals in a string."""
+        return re.findall(r"\d+(?:\.\d+)?", text)
 
+    def _has_negation(self, text: str):
+        """Detect simple negation words."""
+        return any(neg in text for neg in [" not ", " without ", " instead "])
+
+    def _compute_word_overlap(self, ref: str, hyp: str):
+        """
+        Simple word-level F1: 
+        2·|ref∩hyp| / (2·|ref∩hyp| + |hyp−ref| + |ref−hyp|)
+        """
+        ref_set = set(ref.split())
+        hyp_set = set(hyp.split())
+        tp = len(ref_set & hyp_set)
+        fp = len(hyp_set - ref_set)
+        fn = len(ref_set - hyp_set)
+        if tp == 0:
+            return 0.0
+        return 2 * tp / (2*tp + fp + fn)
+
+    def _content_only(self, text: str) -> str:
+        toks = [t for t in text.split()
+                if t.lower() not in self._STOP_WORDS
+                and not all(ch in self._PUNCT for ch in t)]
+        return " ".join(toks)
+    
 
     def compute_classification_metrics(self, y_true, y_pred, average="binary", labels=None):
         try:
@@ -242,51 +444,57 @@ class ClinIQLinkSampleDatasetEvaluate:
             print(f"Error evaluating List question: {e}", flush=True)
             return 0.0
 
+    
     def compute_word_level_similarity(self, expected_text, prediction_text):
         """
-        Compute a word-level similarity score using token embeddings.
-        For each word in expected_text, find the maximum cosine similarity with any word in prediction_text,
-        and vice versa, then compute the harmonic mean of the averaged precision and recall.
-        Returns a float score between 0 and 1.
+        IDF-weighted greedy word alignment using precomputed WordPiece IDF.
         """
         try:
-            expected_words = expected_text.split()
-            prediction_words = prediction_text.split()
-            if not expected_words or not prediction_words:
+            # WordPiece tokenization (only alphanumeric pieces)
+            exp_tokens = [tok for tok in self.tokenizer.tokenize(expected_text) if tok.isalnum()]
+            pred_tokens = [tok for tok in self.tokenizer.tokenize(prediction_text) if tok.isalnum()]
+            if not exp_tokens or not pred_tokens:
                 return 0.0
-            expected_embeds = self.st_model.encode(expected_words, convert_to_tensor=True).cpu().numpy()
-            prediction_embeds = self.st_model.encode(prediction_words, convert_to_tensor=True).cpu().numpy()
-            
-            sims_expected = [np.max(cosine_similarity([embed], prediction_embeds)) for embed in expected_embeds]
-            sims_prediction = [np.max(cosine_similarity([embed], expected_embeds)) for embed in prediction_embeds]
-            
-            recall = np.mean(sims_expected)
-            precision = np.mean(sims_prediction)
-            if (precision + recall) == 0:
+
+            # Lookup IDF for each token (default to 1.0 if unseen)
+            exp_weights = np.array([self._idf_scores.get(tok, 1.0) for tok in exp_tokens])
+            pred_weights = np.array([self._idf_scores.get(tok, 1.0) for tok in pred_tokens])
+
+            # Embed all tokens in one batch
+            exp_emb = self.st_model.encode(exp_tokens, convert_to_tensor=True).cpu().numpy()
+            pred_emb = self.st_model.encode(pred_tokens, convert_to_tensor=True).cpu().numpy()
+
+            # Compute pairwise cosine and do greedy max‑matching
+            sims = cosine_similarity(pred_emb, exp_emb)  # shape (|pred|, |exp|)
+            best_for_pred = sims.max(axis=1)  # precision analogue
+            best_for_exp  = sims.max(axis=0)  # recall analogue
+
+            # Weighted precision & recall → F1
+            precision = (best_for_pred * pred_weights).sum() / pred_weights.sum()
+            recall    = (best_for_exp  * exp_weights).sum()  / exp_weights.sum()
+            if precision + recall == 0:
                 return 0.0
             return 2 * precision * recall / (precision + recall)
+
         except Exception as e:
-            print(f"Error computing word-level similarity: {e}", flush=True)
+            print(f"[word-sim] {e}", flush=True)
             return 0.0
 
-    def compute_sentence_level_similarity(self, expected_text, prediction_text):
+
+    def compute_sentence_level_similarity(self, exp: str, pred: str) -> float:
         """
-        Compute sentence-level similarity by splitting texts into sentences,
-        encoding them, and averaging the maximum cosine similarity for each expected sentence.
-        Returns a float score between 0 and 1.
+        Sentence‐level similarity using single‐vector (CLS) embeddings.
         """
         try:
-            expected_sentences = nltk.sent_tokenize(expected_text)
-            prediction_sentences = nltk.sent_tokenize(prediction_text)
-            if not expected_sentences or not prediction_sentences:
-                return 0.0
-            expected_embeds = self.st_model.encode(expected_sentences, convert_to_tensor=True).cpu().numpy()
-            prediction_embeds = self.st_model.encode(prediction_sentences, convert_to_tensor=True).cpu().numpy()
-            sims = [np.max(cosine_similarity([embed], prediction_embeds)) for embed in expected_embeds]
-            return np.mean(sims)
+            # encode each full sentence as one vector
+            exp_vec  = self.st_model.encode([exp],  convert_to_tensor=True).cpu().numpy()
+            pred_vec = self.st_model.encode([pred], convert_to_tensor=True).cpu().numpy()
+            # single cosine between the two vectors
+            return float(cosine_similarity(exp_vec, pred_vec)[0][0])
         except Exception as e:
             print(f"Error computing sentence-level similarity: {e}", flush=True)
             return 0.0
+
 
     def compute_paragraph_level_similarity(self, expected_text, prediction_text):
         """
@@ -296,8 +504,9 @@ class ClinIQLinkSampleDatasetEvaluate:
         try:
             expected_embed = self.st_model.encode(expected_text, convert_to_tensor=True).cpu().numpy()
             prediction_embed = self.st_model.encode(prediction_text, convert_to_tensor=True).cpu().numpy()
-            sim = cosine_similarity([expected_embed], [prediction_embed])[0][0]
-            return sim
+            raw = cosine_similarity([expected_embed], [prediction_embed])[0][0]
+            adj = (raw - self.para_baseline) / (1 - self.para_baseline)
+            return max(0.0, adj)
         except Exception as e:
             print(f"Error computing paragraph-level similarity: {e}", flush=True)
             return 0.0
@@ -306,49 +515,49 @@ class ClinIQLinkSampleDatasetEvaluate:
     def evaluate_open_ended(self, expected, prediction):
         """
         Evaluate open-ended questions using semantic similarity:
-        - 1.0 if exact match
-        - Weighted similarity of:
-            - word-level (0.3)
-            - sentence-level (0.3)
-            - paragraph-level (0.4)
-        - Score thresholds:
-            - >= 0.9 → 1.0
-            - <= 0.4 → 0.0
-            - Linear interpolation in-between
+            - exact match → 1.0
+            - IDF-/stop-word-cleaned similarities:
+                word (0.4), sentence (0.4), paragraph (0.2)
+            - clamp out the ~0.25 SBERT bias
+            - cap at 1.0
         """
         try:
-            # Convert lists to strings, remove whitespace
+            # prepare raw strings
             if isinstance(expected, list):
                 expected = " ".join(expected)
             if isinstance(prediction, list):
                 prediction = " ".join(prediction)
+            expected_raw   = expected.strip()
+            prediction_raw = prediction.strip()
 
-            expected = expected.strip()
-            prediction = prediction.strip()
+            # strip stop-words + punctuation for all sims
+            expected = self._content_only(expected_raw)
+            prediction = self._content_only(prediction_raw)
 
-            # Exact match
-            if expected.lower() == prediction.lower():
+            # exact‐match shortcut
+            if expected_raw.lower() == prediction_raw.lower():
                 return 1.0
 
-            # Compute semantic similarity at three levels
-            w_word, w_sent, w_para = 0.3, 0.3, 0.4
-
+            # compute sims with new weights
+            w_word, w_sent, w_para = 0.4, 0.4, 0.2
             word_sim      = self.compute_word_level_similarity(expected, prediction)
             sentence_sim  = self.compute_sentence_level_similarity(expected, prediction)
             paragraph_sim = self.compute_paragraph_level_similarity(expected, prediction)
 
-            semantic_score = w_word * word_sim + w_sent * sentence_sim + w_para * paragraph_sim
+            semantic_score = (w_word * word_sim
+                            + w_sent * sentence_sim
+                            + w_para * paragraph_sim)
 
-            # Map similarity to final score
-            if semantic_score >= 0.9:
-                return 1.0
-            elif semantic_score <= 0.4:
-                return 0.0
-            else:
-                return (semantic_score - 0.4) / (0.9 - 0.4)  # linear interpolation
+            # clamp out base SBERT bias (~0.25 for unrelated)
+            semantic_score = max(0.0, semantic_score - 0.25)
+
+            # threshold to 1.0
+            return 1.0 if semantic_score >= 0.95 else semantic_score
+
         except Exception as e:
             print(f"Error evaluating open-ended question: {e}", flush=True)
             return 0.0
+
 
         
     def evaluate_open_ended_metrics(self, expected, prediction):
@@ -390,88 +599,221 @@ class ClinIQLinkSampleDatasetEvaluate:
 
 
 
+    # def evaluate_true_false_questions(self):
+    #     """
+    #     Evaluate all True/False questions using precision, recall, and F1.
+    #     Accepts only 'true' or 'false' predictions.
+    #     Returns all metrics along with per-example scores.
+    #     """
+    #     try:
+    #         blob = self.output_data.get("true_false")
+    #         if not blob:
+    #             print("No True/False output data found.", flush=True)
+    #             return {"average": 0.0, "precision": 0.0, "recall": 0.0, "f1_score": 0.0, "scores": {}}
+
+    #         inputs = blob.get("inputs", [])
+    #         predictions = blob.get("responses", [])
+
+    #         if len(inputs) != len(predictions):
+    #             print("Mismatch in number of inputs and predictions.", flush=True)
+    #             return {"average": 0.0, "precision": 0.0, "recall": 0.0, "f1_score": 0.0, "scores": {}}
+
+    #         results = {}
+    #         all_expected = []
+    #         all_predicted = []
+
+    #         for gold, pred in zip(inputs, predictions):
+    #             predicted = self._to_text(pred).strip().lower()
+    #             expected = str(gold.get("answer", "")).strip().lower()
+
+    #             # Accept *only* the exact words "true" or "false"
+    #             if predicted == "true" or predicted == "false":
+    #                 all_expected.append(expected)
+    #                 all_predicted.append(predicted)
+    #                 score = 1.0 if predicted == expected else 0.0
+    #             else:
+    #                 all_expected.append(expected)
+    #                 all_predicted.append("invalid")  # force a false match
+    #                 score = 0.0
+
+    #             para_id = gold.get("source", {}).get("paragraph_id", "unknown")
+    #             results[para_id] = {
+    #                 "question": gold.get("question", ""),
+    #                 "expected": expected,
+    #                 "predicted": predicted,
+    #                 "score": score,
+    #                 "source": gold.get("source", {})
+    #             }
+
+    #         # Compute precision, recall, and F1 using your existing method
+    #         # Convert true/false to binary labels: true=1, false=0
+    #         binary_map = {"true": 1, "false": 0}
+    #         try:
+    #             true_labels = [binary_map.get(e, 0) for e in all_expected]
+    #             pred_labels = [binary_map.get(p, 0) for p in all_predicted]
+    #         except Exception as label_error:
+    #             print(f"Label conversion error: {label_error}", flush=True)
+    #             return {"average": 0.0, "precision": 0.0, "recall": 0.0, "f1_score": 0.0, "scores": results}
+
+    #         precision, recall, f1 = self._safe_binary_metrics(true_labels, pred_labels)
+    #         avg_score = sum(results[pid]["score"] for pid in results) / len(results) if results else 0.0
+
+    #         print(f"True/False Precision: {precision:.2f}, Recall: {recall:.2f}, F1: {f1:.2f}", flush=True)
+
+    #         return {
+    #             "average": avg_score,
+    #             "precision": precision,
+    #             "recall": recall,
+    #             "f1_score": f1,
+    #             "scores": results
+    #         }
+
+    #     except Exception as e:
+    #         print(f"Error evaluating True/False questions: {e}", flush=True)
+    #         return {"average": 0.0, "precision": 0.0, "recall": 0.0, "f1_score": 0.0, "scores": {}}
+
     def evaluate_true_false_questions(self):
         """
-        Evaluate all True/False questions using precision, recall, and F1.
-        Accepts only 'true' or 'false' predictions.
-        Returns all metrics along with per-example scores.
+        True/False (yes‑no) questions are scored with **accuracy** –
+        the proportion of items answered exactly correctly.
         """
         try:
             blob = self.output_data.get("true_false")
             if not blob:
                 print("No True/False output data found.", flush=True)
-                return {"average": 0.0, "precision": 0.0, "recall": 0.0, "f1_score": 0.0, "scores": {}}
+                return {"accuracy": 0.0, "scores": {}}
 
-            inputs = blob.get("inputs", [])
-            predictions = blob.get("responses", [])
+            inputs       = blob.get("inputs", [])
+            predictions  = blob.get("responses", [])
 
             if len(inputs) != len(predictions):
                 print("Mismatch in number of inputs and predictions.", flush=True)
-                return {"average": 0.0, "precision": 0.0, "recall": 0.0, "f1_score": 0.0, "scores": {}}
+                return {"accuracy": 0.0, "scores": {}}
 
-            results = {}
-            all_expected = []
-            all_predicted = []
+            results     = {}
+            correct_cnt = 0
 
             for gold, pred in zip(inputs, predictions):
-                predicted = self._to_text(pred).strip().lower()
-                expected = str(gold.get("answer", "")).strip().lower()
+                expected   = str(gold.get("answer", "")).strip().lower()
+                predicted  = self._to_text(pred).strip().lower()
 
-                # Accept *only* the exact words "true" or "false"
-                if predicted == "true" or predicted == "false":
-                    all_expected.append(expected)
-                    all_predicted.append(predicted)
-                    score = 1.0 if predicted == expected else 0.0
-                else:
-                    all_expected.append(expected)
-                    all_predicted.append("invalid")  # force a false match
-                    score = 0.0
+                is_correct = expected == predicted
+                correct_cnt += int(is_correct)
 
                 para_id = gold.get("source", {}).get("paragraph_id", "unknown")
                 results[para_id] = {
-                    "question": gold.get("question", ""),
-                    "expected": expected,
+                    "question":  gold.get("question", ""),
+                    "expected":  expected,
                     "predicted": predicted,
-                    "score": score,
-                    "source": gold.get("source", {})
+                    "correct":   is_correct,
+                    "source":    gold.get("source", {})
                 }
 
-            # Compute precision, recall, and F1 using your existing method
-            # Convert true/false to binary labels: true=1, false=0
-            binary_map = {"true": 1, "false": 0}
-            try:
-                true_labels = [binary_map.get(e, 0) for e in all_expected]
-                pred_labels = [binary_map.get(p, 0) for p in all_predicted]
-            except Exception as label_error:
-                print(f"Label conversion error: {label_error}", flush=True)
-                return {"average": 0.0, "precision": 0.0, "recall": 0.0, "f1_score": 0.0, "scores": results}
+            accuracy = correct_cnt / len(inputs) if inputs else 0.0
+            print(f"True/False Accuracy: {accuracy:.3f}", flush=True)
 
-            precision, recall, f1 = self._safe_binary_metrics(true_labels, pred_labels)
-            avg_score = sum(results[pid]["score"] for pid in results) / len(results) if results else 0.0
-
-            print(f"True/False Precision: {precision:.2f}, Recall: {recall:.2f}, F1: {f1:.2f}", flush=True)
-
-            return {
-                "average": avg_score,
-                "precision": precision,
-                "recall": recall,
-                "f1_score": f1,
-                "scores": results
-            }
+            return {"accuracy": accuracy, "scores": results}
 
         except Exception as e:
             print(f"Error evaluating True/False questions: {e}", flush=True)
-            return {"average": 0.0, "precision": 0.0, "recall": 0.0, "f1_score": 0.0, "scores": {}}
+            return {"accuracy": 0.0, "scores": {}}
+
+
+    # def evaluate_multiple_choice_questions(self):
+    #     """
+    #     Evaluate Multiple Choice questions by normalizing and comparing text-to-text.
+    #     Returns average score, precision, recall, F1, and per-question results.
+    #     """
+
+    #     def normalise(text: str) -> str:
+    #         """Lowercase, strip, collapse whitespace, remove most punctuation."""
+    #         text = re.sub(r"[^\w\s%]", "", text.lower())
+    #         return re.sub(r"\s+", " ", text).strip()
+
+    #     try:
+    #         blob = self.output_data.get("multiple_choice")
+    #         if not blob:
+    #             print("No Multiple Choice output data found.", flush=True)
+    #             return {"average": 0.0, "precision": 0.0, "recall": 0.0, "f1_score": 0.0, "scores": {}}
+
+    #         inputs = blob.get("inputs", [])
+    #         predictions = blob.get("responses", [])
+
+    #         if len(inputs) != len(predictions):
+    #             print("Mismatch in number of inputs and predictions.", flush=True)
+    #             return {"average": 0.0, "precision": 0.0, "recall": 0.0, "f1_score": 0.0, "scores": {}}
+
+    #         results = {}
+    #         all_expected = []
+    #         all_predicted = []
+    #         raw_scores = []
+
+    #         for gold, pred in zip(inputs, predictions):
+    #             try:
+    #                 options = gold.get("options", {})
+    #                 if isinstance(options, list):
+    #                     options = {chr(65 + idx): opt for idx, opt in enumerate(options)}
+
+    #                 # Handle whether correct_answer is a letter ("B") or full text
+    #                 correct_raw = str(gold.get("correct_answer", "")).strip()
+    #                 if len(correct_raw) == 1 and correct_raw.upper() in options:
+    #                     expected_orig = options[correct_raw.upper()]
+    #                 else:
+    #                     expected_orig = correct_raw
+
+    #                 expected_text = normalise(expected_orig)
+    #                 predicted_text = normalise(self._to_text(pred))
+
+    #                 score = 1.0 if predicted_text == expected_text else 0.0
+    #                 raw_scores.append(score)
+
+    #                 all_expected.append(expected_text)
+    #                 all_predicted.append(predicted_text)
+
+    #                 para_id = gold.get("source", {}).get("paragraph_id", "unknown")
+    #                 results[para_id] = {
+    #                     "question": gold.get("question", ""),
+    #                     "expected": expected_orig,           # raw human-readable expected text
+    #                     "predicted": self._to_text(pred),     # raw model output
+    #                     "predicted_text": self._to_text(pred),
+    #                     "options": options,
+    #                     "score": score,
+    #                     "source": gold.get("source", {})
+    #                 }
+    #             except Exception as inner_e:
+    #                 print(f"Error evaluating multiple choice QA: {inner_e}", flush=True)
+
+    #         avg_score = sum(raw_scores) / len(raw_scores) if raw_scores else 0.0
+
+    #         # Binary labels for precision/recall/F1
+    #         all_expected_bin = [1 for _ in all_expected]  # All expected = 1
+    #         all_predicted_bin = [1 if p == e else 0 for p, e in zip(all_predicted, all_expected)]
+
+    #         precision, recall, f1 = self.compute_classification_metrics(
+    #             all_expected_bin, all_predicted_bin, average="binary"
+    #         )
+
+    #         print(f"Multiple Choice Precision: {precision:.2f}, Recall: {recall:.2f}, F1: {f1:.2f}", flush=True)
+
+    #         return {
+    #             "average": avg_score,
+    #             "precision": precision,
+    #             "recall": recall,
+    #             "f1_score": f1,
+    #             "scores": results
+    #         }
+
+    #     except Exception as e:
+    #         print(f"Error evaluating Multiple Choice questions: {e}", flush=True)
+    #         return {"average": 0.0, "precision": 0.0, "recall": 0.0, "f1_score": 0.0, "scores": {}}
 
 
     def evaluate_multiple_choice_questions(self):
         """
-        Evaluate Multiple Choice questions by normalizing and comparing text-to-text.
-        Returns average score, precision, recall, F1, and per-question results.
+        Multiple‑choice questions are scored with **accuracy** –
+        the fraction of questions where the selected option is exactly correct.
         """
-
         def normalise(text: str) -> str:
-            """Lowercase, strip, collapse whitespace, remove most punctuation."""
             text = re.sub(r"[^\w\s%]", "", text.lower())
             return re.sub(r"\s+", " ", text).strip()
 
@@ -479,79 +821,51 @@ class ClinIQLinkSampleDatasetEvaluate:
             blob = self.output_data.get("multiple_choice")
             if not blob:
                 print("No Multiple Choice output data found.", flush=True)
-                return {"average": 0.0, "precision": 0.0, "recall": 0.0, "f1_score": 0.0, "scores": {}}
+                return {"accuracy": 0.0, "scores": {}}
 
-            inputs = blob.get("inputs", [])
+            inputs      = blob.get("inputs", [])
             predictions = blob.get("responses", [])
 
             if len(inputs) != len(predictions):
                 print("Mismatch in number of inputs and predictions.", flush=True)
-                return {"average": 0.0, "precision": 0.0, "recall": 0.0, "f1_score": 0.0, "scores": {}}
+                return {"accuracy": 0.0, "scores": {}}
 
-            results = {}
-            all_expected = []
-            all_predicted = []
-            raw_scores = []
+            results     = {}
+            correct_cnt = 0
 
             for gold, pred in zip(inputs, predictions):
-                try:
-                    options = gold.get("options", {})
-                    if isinstance(options, list):
-                        options = {chr(65 + idx): opt for idx, opt in enumerate(options)}
+                # Build {letter → option_text} if needed
+                opts = gold.get("options", {})
+                if isinstance(opts, list):
+                    opts = {chr(65 + i): o for i, o in enumerate(opts)}
 
-                    # Handle whether correct_answer is a letter ("B") or full text
-                    correct_raw = str(gold.get("correct_answer", "")).strip()
-                    if len(correct_raw) == 1 and correct_raw.upper() in options:
-                        expected_orig = options[correct_raw.upper()]
-                    else:
-                        expected_orig = correct_raw
+                gold_raw = str(gold.get("correct_answer", "")).strip()
+                gold_txt = opts.get(gold_raw.upper(), gold_raw)
+                expected = normalise(gold_txt)
 
-                    expected_text = normalise(expected_orig)
-                    predicted_text = normalise(self._to_text(pred))
+                predicted_txt = normalise(self._to_text(pred))
 
-                    score = 1.0 if predicted_text == expected_text else 0.0
-                    raw_scores.append(score)
+                is_correct = predicted_txt == expected
+                correct_cnt += int(is_correct)
 
-                    all_expected.append(expected_text)
-                    all_predicted.append(predicted_text)
+                para_id = gold.get("source", {}).get("paragraph_id", "unknown")
+                results[para_id] = {
+                    "question":  gold.get("question", ""),
+                    "expected":  gold_txt,
+                    "predicted": self._to_text(pred),
+                    "correct":   is_correct,
+                    "options":   opts,
+                    "source":    gold.get("source", {})
+                }
 
-                    para_id = gold.get("source", {}).get("paragraph_id", "unknown")
-                    results[para_id] = {
-                        "question": gold.get("question", ""),
-                        "expected": expected_orig,           # raw human-readable expected text
-                        "predicted": self._to_text(pred),     # raw model output
-                        "predicted_text": self._to_text(pred),
-                        "options": options,
-                        "score": score,
-                        "source": gold.get("source", {})
-                    }
-                except Exception as inner_e:
-                    print(f"Error evaluating multiple choice QA: {inner_e}", flush=True)
+            accuracy = correct_cnt / len(inputs) if inputs else 0.0
+            print(f"Multiple‑Choice Accuracy: {accuracy:.3f}", flush=True)
 
-            avg_score = sum(raw_scores) / len(raw_scores) if raw_scores else 0.0
-
-            # Binary labels for precision/recall/F1
-            all_expected_bin = [1 for _ in all_expected]  # All expected = 1
-            all_predicted_bin = [1 if p == e else 0 for p, e in zip(all_predicted, all_expected)]
-
-            precision, recall, f1 = self.compute_classification_metrics(
-                all_expected_bin, all_predicted_bin, average="binary"
-            )
-
-            print(f"Multiple Choice Precision: {precision:.2f}, Recall: {recall:.2f}, F1: {f1:.2f}", flush=True)
-
-            return {
-                "average": avg_score,
-                "precision": precision,
-                "recall": recall,
-                "f1_score": f1,
-                "scores": results
-            }
+            return {"accuracy": accuracy, "scores": results}
 
         except Exception as e:
             print(f"Error evaluating Multiple Choice questions: {e}", flush=True)
-            return {"average": 0.0, "precision": 0.0, "recall": 0.0, "f1_score": 0.0, "scores": {}}
-
+            return {"accuracy": 0.0, "scores": {}}
 
 
     def evaluate_list_questions(self):
@@ -745,6 +1059,9 @@ class ClinIQLinkSampleDatasetEvaluate:
                         sim_score = 0.0
                         metrics = {"bleu": 0.0, "meteor": 0.0, "rouge": 0.0}
                     else:
+                        raw = self._to_text(predicted).strip().lower()
+                        predicted = re.sub(r"^incorrect explanation:\s*", "", raw, flags=re.I)
+
                         sim_score = self.evaluate_open_ended(expected, predicted)
                         metrics = self.evaluate_open_ended_metrics(expected, predicted)
 
@@ -840,13 +1157,43 @@ class ClinIQLinkSampleDatasetEvaluate:
 
 
 
+    def _extract_step_number(self, txt: str):
+        """
+        Return the first integer that follows the word 'step' (case‑insensitive),
+        or None if not found.
+        """
+        m = re.search(r"step\s*([0-9]+)", txt, flags=re.I)
+        return int(m.group(1)) if m else None
+
+
+    def _penalise_similarity(self, base_sim: float, step_distance: int):
+        """
+        Down‐weight the semantic score by how far the predicted step is 
+        from the true one. Closer → milder penalty:
+            distance=0 → 1.0×
+            distance=1 → 0.7×
+            distance=2 → 0.3×
+            distance=3 → 0.15×
+            distance=4 → 0.075×  (and so on halving each extra step)
+        """
+        if step_distance is None or step_distance == 0:
+            return base_sim
+
+        if step_distance == 1:
+            factor = 0.7
+        elif step_distance == 2:
+            factor = 0.3
+        else:
+            # for d ≥ 3, halve the distance-2 penalty each extra step
+            factor = 0.3 / (2 ** (step_distance - 2))
+
+        return base_sim * factor
+
+    
     def evaluate_multi_hop_inverse_questions(self):
         """
-        Evaluate Multi-hop Inverse questions using semantic similarity metrics.
-        - Uses weighted word/sentence/paragraph embedding similarity
-        - Returns:
-            - Average semantic similarity as `semantic_match_score`
-            - Per-question breakdowns with BLEU, METEOR, and ROUGE
+        Evaluate Multi-hop Inverse questions using semantic similarity metrics,
+        penalized by how far the predicted step is from the true incorrect step.
         """
         try:
             blob = self.output_data.get("multi_hop_inverse")
@@ -854,54 +1201,250 @@ class ClinIQLinkSampleDatasetEvaluate:
                 print("No Multi-hop Inverse output data found.", flush=True)
                 return {"semantic_match_score": 0.0, "scores": {}}
 
-            inputs = blob.get("inputs", [])
+            inputs      = blob.get("inputs", [])
             predictions = blob.get("responses", [])
-
             if len(inputs) != len(predictions):
-                print("Mismatch in number of inputs and predictions.", flush=True)
+                print("Mismatch in inputs vs responses for Multi-hop Inverse.", flush=True)
                 return {"semantic_match_score": 0.0, "scores": {}}
 
             results = {}
-            scores = []
+            scores  = []
 
             for gold, pred in zip(inputs, predictions):
                 try:
-                    predicted = self._to_text(pred).strip().lower()
-                    question = str(gold.get("question", "")).strip().lower()
-                    expected = str(gold.get("incorrect_reasoning_step", "")).strip()
-
-                    if predicted == question:
-                        sim_score = 0.0
-                        metrics = {"bleu": 0.0, "meteor": 0.0, "rouge": 0.0}
+                    # --- ground truth step & explanation ---
+                    irs = gold.get("incorrect_reasoning_step", "")
+                    # turn it into a list of non-empty lines
+                    if isinstance(irs, list):
+                        lines = irs
                     else:
-                        sim_score = self.evaluate_open_ended(expected, predicted)
-                        metrics = self.evaluate_open_ended_metrics(expected, predicted)
+                        lines = [l.strip() for l in irs.splitlines() if l.strip()]
+
+                    # find the line that mentions the step (e.g. "- **Step 4** contains ...")
+                    step_line = next(
+                        (l for l in lines
+                        if re.search(r"\bStep\b.*?(\d+)", l, flags=re.I)),
+                        ""
+                    )
+
+                    # find the line that contains the explanation
+                    expl_line = next(
+                        (l for l in lines
+                        if re.search(r"Explanation", l, flags=re.I)),
+                        ""
+                    )
+
+                    # extract the integer step
+                    gt_step_number = self._extract_step_number(step_line)
+
+                    # rip off everything up to the colon so we just get the explanation text
+                    gt_expl = expl_line.split(":", 1)[-1].strip()
+
+                    # --- model output parsing ---
+                    raw_txt = self._to_text(pred).strip()
+                    # ppredicted-step extraction
+                    step_match = re.search(
+                        r"(?:incorrect reasoning step\s*[:\-]?\s*|step\s*[:\-]?\s*)(\d+)",
+                        raw_txt,
+                        flags=re.IGNORECASE
+                    )
+                    pred_step = int(step_match.group(1)) if step_match else None
+
+                    # robust explanation extraction
+                    # match either header “Incorrect Reasoning Explanation” or just “Explanation”
+                    expl_parts = re.split(
+                        r"(?:incorrect reasoning explanation|explanation)\s*[:\-]?",
+                        raw_txt,
+                        flags=re.IGNORECASE,
+                        maxsplit=1
+                    )
+                    pred_expl = expl_parts[1].strip() if len(expl_parts) == 2 else raw_txt
+
+                    # --- compute base sim + penalty ---
+                    base_sim = self.evaluate_open_ended(gt_expl, pred_expl)
+                    dist     = (abs(gt_step_number - pred_step)
+                                if gt_step_number is not None and pred_step is not None
+                                else None)
+                    sim_score = self._penalise_similarity(base_sim, dist)
+                    step_corr = 1.0 if gt_step_number == pred_step else 0.0
 
                     para_id = gold.get("source", {}).get("paragraph_id", "unknown")
                     results[para_id] = {
-                        "question": gold.get("question", ""),
-                        "expected": expected,
-                        "predicted": predicted,
-                        "semantic_match_score": sim_score,
-                        "metrics": metrics,
-                        "source": gold.get("source", {})
+                        "question":              gold.get("question", ""),
+                        "expected_step":         gt_step_number,
+                        "predicted_step":        pred_step,
+                        "step_distance":         dist,
+                        "step_correct":          step_corr,
+                        "expected_explanation":  gt_expl,
+                        "predicted_explanation": pred_expl,
+                        "semantic_match_score":  sim_score,
+                        "metrics":               self.evaluate_open_ended_metrics(gt_expl, pred_expl),
+                        "source":                gold.get("source", {})
                     }
                     scores.append(sim_score)
 
                 except Exception as inner_e:
                     print(f"Error evaluating Multi-hop Inverse QA: {inner_e}", flush=True)
 
-            avg_score = sum(scores) / len(scores) if scores else 0.0
+            avg_score = float(np.mean(scores)) if scores else 0.0
+            # compute average step-identification rate
+            step_rates = [v["step_correct"] for v in results.values()]
+            avg_step_identification_rate = float(np.mean(step_rates)) if step_rates else 0.0
+
             print(f"Average Multi-hop Inverse Semantic Similarity Score: {avg_score:.2f}", flush=True)
+            print(f"Step identification accuracy: {avg_step_identification_rate:.2f}", flush=True)
 
             return {
-                "semantic_match_score": avg_score,
-                "scores": results
+                "semantic_match_score":       avg_score,
+                "step_identification_rate":   avg_step_identification_rate,
+                "scores":                     results
             }
 
         except Exception as e:
-            print(f"Error evaluating Multi-hop Inverse questions: {e}", flush=True)
+            print(f"Error in evaluate_multi_hop_inverse_questions: {e}", flush=True)
             return {"semantic_match_score": 0.0, "scores": {}}
+
+
+
+    def plot_ecdfs(self, score_dict, out_dir, metric="semantic"):
+        plots_dir = os.path.join(out_dir, "plots")
+        os.makedirs(plots_dir, exist_ok=True)
+        fig, ax = plt.subplots(figsize=(8,5))
+        for key, scores in score_dict.items():
+            if not scores:
+                continue
+            x = np.sort(scores)
+            y = np.arange(1, len(x)+1) / len(x)
+            ax.plot(x, y, marker='.', linestyle='none',
+                    label=key.replace('_',' ').title())
+        ax.set_xlabel(metric.title() + " value")
+        ax.set_ylabel("ECDF")
+        ax.set_xlim(0,1)
+        ax.legend()
+        plt.tight_layout()
+        fig.savefig(os.path.join(plots_dir, f"{metric}_ecdfs.svg"))
+        plt.close(fig)
+
+    def plot_boxplots(self, score_dict, out_dir, metric="semantic"):
+        plots_dir = os.path.join(out_dir, "plots")
+        os.makedirs(plots_dir, exist_ok=True)
+        labels, data = [], []
+        for key, scores in score_dict.items():
+            if not scores: continue
+            labels.append(key.replace('_',' ').title())
+            data.append(scores)
+        fig, ax = plt.subplots(figsize=(8,5))
+        ax.boxplot(data, labels=labels, showfliers=True, vert=True)
+        ax.set_ylabel(metric.title() + " value")
+        ax.set_xticklabels(labels, rotation=15, ha="right")
+        ax.set_ylim(0,1)
+        plt.tight_layout()
+        fig.savefig(os.path.join(plots_dir, f"{metric}_boxplots.svg"))
+        plt.close(fig)
+
+    def plot_jitter_scatter(self, score_dict, out_dir, metric="semantic"):
+        plots_dir = os.path.join(out_dir, "plots")
+        os.makedirs(plots_dir, exist_ok=True)
+        fig, ax = plt.subplots(figsize=(8,5))
+        for i, (key, scores) in enumerate(score_dict.items()):
+            if not scores: continue
+            x = scores
+            y = np.random.uniform(i - 0.1, i + 0.1, size=len(x))
+            ax.plot(x, y, 'o', alpha=0.4,
+                    label=key.replace('_',' ').title())
+        ax.set_xlabel(metric.title() + " value")
+        ax.set_yticks(range(len(score_dict)))
+        ax.set_yticklabels([k.replace('_',' ').title()
+                            for k in score_dict.keys()])
+        ax.set_xlim(0,1)
+        plt.tight_layout()
+        fig.savefig(os.path.join(plots_dir, f"{metric}_jitter.svg"))
+        plt.close(fig)
+
+    def plot_histograms(self, score_dict, out_dir, metric="semantic"):
+        plots_dir = os.path.join(out_dir, "plots")
+        os.makedirs(plots_dir, exist_ok=True)
+        bins = np.arange(0.0, 1.0 + self.bin_width, self.bin_width)
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+        keys = list(score_dict.keys())
+        for ax, key in zip(axes.flat, keys):
+            scores = score_dict[key]
+            if not scores:
+                ax.set_visible(False)
+                continue
+            weights = np.ones_like(scores) / len(scores)
+            ax.hist(scores, bins=bins, weights=weights, edgecolor="black")
+            ax.set_title(key.replace("_", " ").title())
+            ax.set_xlim(0,1)
+            ax.set_ylim(0,1)
+            ax.set_xlabel(metric.title() + " value")
+            ax.set_ylabel("Proportion")
+            ax.set_xticks(bins)
+        plt.tight_layout()
+        fig.savefig(os.path.join(plots_dir, f"{metric}_histograms.svg"))
+        plt.close(fig)
+
+    def plot_dashboard(self, all_score_dicts, out_dir):
+        """
+        all_score_dicts: dict of metric→score_dict
+        Produces an n×3 grid: rows=metrics, cols=(box, jitter, hist)
+        """
+        plots_dir = os.path.join(out_dir, "plots")
+        os.makedirs(plots_dir, exist_ok=True)
+
+        metrics = list(all_score_dicts.keys())
+        n = len(metrics)
+
+        # 3 columns now (box, jitter, hist)
+        fig, axes = plt.subplots(n, 3, figsize=(12, 3*n), squeeze=False)
+
+        for i, metric in enumerate(metrics):
+            sd = all_score_dicts[metric]
+
+            # ─── Boxplot (col 0)
+            ax = axes[i, 0]
+            data   = [sd[k] for k in sd if sd[k]]
+            labels = [k.replace('_',' ').title() for k in sd if sd[k]]
+            if data:
+                ax.boxplot(data, labels=labels, showfliers=True)
+                ax.set_xticklabels(labels, rotation=45, ha='right')
+            ax.set_title(f"{metric.title()} Boxplot")
+            ax.set_ylim(0, 1)
+
+            # ─── Jitter (col 1)
+            ax = axes[i, 1]
+            for j, (key, scores) in enumerate(sd.items()):
+                if not scores:
+                    continue
+                y = np.random.uniform(j - 0.1, j + 0.1, size=len(scores))
+                ax.plot(scores, y, 'o', alpha=0.4)
+            ax.set_title(f"{metric.title()} Jitter")
+            ax.set_xlim(0, 1)
+            ax.set_yticks(range(len(sd)))
+            ax.set_yticklabels([k.replace('_',' ').title() for k in sd])
+
+            # ─── Histogram (col 2)
+            ax = axes[i, 2]
+            bins = np.arange(0.0, 1.0 + self.bin_width, self.bin_width)
+            for key, scores in sd.items():
+                if not scores:
+                    continue
+                weights = np.ones_like(scores) / len(scores)
+                ax.hist(
+                    scores,
+                    bins=bins,
+                    weights=weights,
+                    alpha=0.5,
+                    label=key.replace('_',' ').title()
+                )
+            ax.set_title(f"{metric.title()} Histogram")
+            ax.set_xlim(0, 1)
+            ax.legend(loc='upper right', fontsize='small')
+
+        plt.tight_layout()
+        fig.savefig(os.path.join(plots_dir, "all_metrics_dashboard.svg"), format="svg")
+        plt.close(fig)
+
 
 
 
@@ -923,6 +1466,9 @@ class ClinIQLinkSampleDatasetEvaluate:
             short_inverse_results = self.evaluate_short_inverse_questions()
             multi_hop_results = self.evaluate_multi_hop_questions()
             multi_hop_inverse_results = self.evaluate_multi_hop_inverse_questions()
+
+            overall_results["multi_hop_inverse_step_identification_rate"] = \
+                multi_hop_inverse_results.get("step_identification_rate", 0.0)
 
             # Organize and save grouped results
             grouped_outputs = {
@@ -965,6 +1511,122 @@ class ClinIQLinkSampleDatasetEvaluate:
             overall_results["multi_hop"]         = multi_hop_results
             overall_results["multi_hop_inverse"] = multi_hop_inverse_results
 
+            open_ended_metrics = {}
+            for name, result in [
+                ("short", short_results),
+                ("short_inverse", short_inverse_results),
+                ("multi_hop", multi_hop_results),
+                ("multi_hop_inverse", multi_hop_inverse_results),
+            ]:
+                # extract the per‐item metric dicts
+                metrics_list = [v["metrics"] for v in result["scores"].values()]
+                bleus   = [m["bleu"]   for m in metrics_list]
+                meteors = [m["meteor"] for m in metrics_list]
+                rouges  = [m["rouge"]  for m in metrics_list]
+
+                open_ended_metrics[name] = {
+                    "avg_bleu":   sum(bleus)   / len(bleus)   if bleus   else 0.0,
+                    "avg_meteor": sum(meteors) / len(meteors) if meteors else 0.0,
+                    "avg_rouge":  sum(rouges)  / len(rouges)  if rouges  else 0.0,
+                }
+
+            # ─── Compute overall average of those three across all open‑ended types ───
+            overall_open = {
+                "avg_bleu":   sum(m["avg_bleu"]   for m in open_ended_metrics.values()) / len(open_ended_metrics),
+                "avg_meteor": sum(m["avg_meteor"] for m in open_ended_metrics.values()) / len(open_ended_metrics),
+                "avg_rouge":  sum(m["avg_rouge"]  for m in open_ended_metrics.values()) / len(open_ended_metrics),
+            }
+
+            # ─── Attach into your overall_results structure ───
+            overall_results["open_ended_metrics_per_type"] = open_ended_metrics
+            overall_results["open_ended_metrics_overall"]   = overall_open
+
+
+            # --------------- gather open‑ended similarity distributions ---------------
+            open_ended_scores = {
+                "short":           [v["semantic_match_score"] for v in short_results["scores"].values()],
+                "short_inverse":   [v["semantic_match_score"] for v in short_inverse_results["scores"].values()],
+                "multi_hop":       [v["semantic_match_score"] for v in multi_hop_results["scores"].values()],
+                "multi_hop_inverse":[v["semantic_match_score"] for v in multi_hop_inverse_results["scores"].values()],
+            }
+
+            # ────── compute single “overall effectiveness” score ──────
+            to_avg = [
+                overall_results["true_false"]["accuracy"],
+                overall_results["multiple_choice"]["accuracy"],
+                overall_results["list"]["macro_f1_score"],
+                overall_results["short"]["semantic_match_score"],
+                overall_results["short_inverse"]["semantic_match_score"],
+                overall_results["multi_hop"]["semantic_match_score"],
+                overall_results["multi_hop_inverse"]["semantic_match_score"],
+            ]
+            overall_score = float(np.mean(to_avg))
+            overall_results["overall_effectiveness"] = overall_score
+            print(f"Overall effectiveness score: {overall_score:.3f}", flush=True)
+            # ────────────────────────────────────────────────────────────
+
+            # descriptive stats
+            for k, vals in open_ended_scores.items():
+                if not vals:
+                    continue
+                arr = np.array(vals)
+                overall_results.setdefault("open_ended_stats", {})[k] = {
+                    "min":   float(arr.min()),
+                    "p25":   float(np.percentile(arr, 25)),
+                    "median":float(np.median(arr)),
+                    "p75":   float(np.percentile(arr, 75)),
+                    "max":   float(arr.max()),
+                }
+
+                # ───────── semantic‐similarity plots ─────────
+                # self.plot_ecdfs(open_ended_scores,    output_dir, metric="semantic")
+                self.plot_boxplots(open_ended_scores, output_dir, metric="semantic")
+                self.plot_jitter_scatter(open_ended_scores, output_dir, metric="semantic")
+                self.plot_histograms(open_ended_scores,   output_dir, metric="semantic")
+
+                # ───────── BLEU/METEOR/ROUGE plots ─────────
+                all_metrics = {
+                    "bleu":   { k: [v["metrics"]["bleu"]   for v in res["scores"].values()]
+                                for k,res in zip(
+                                    ["short","short_inverse","multi_hop","multi_hop_inverse"],
+                                    [short_results, short_inverse_results,
+                                    multi_hop_results, multi_hop_inverse_results]
+                                )},
+                    "meteor": { k: [v["metrics"]["meteor"] for v in res["scores"].values()]
+                                for k,res in zip(
+                                    ["short","short_inverse","multi_hop","multi_hop_inverse"],
+                                    [short_results, short_inverse_results,
+                                    multi_hop_results, multi_hop_inverse_results]
+                                )},
+                    "rouge":  { k: [v["metrics"]["rouge"]  for v in res["scores"].values()]
+                                for k,res in zip(
+                                    ["short","short_inverse","multi_hop","multi_hop_inverse"],
+                                    [short_results, short_inverse_results,
+                                    multi_hop_results, multi_hop_inverse_results]
+                                )},
+                }
+
+                for metric, sd in all_metrics.items():
+                    # self.plot_ecdfs(sd,    output_dir, metric=metric)
+                    self.plot_boxplots(sd, output_dir, metric=metric)
+                    self.plot_jitter_scatter(sd, output_dir, metric=metric)
+                    self.plot_histograms(sd,   output_dir, metric=metric)
+
+                # ───────── combined dashboard ─────────
+                self.plot_dashboard(
+                    {"semantic": open_ended_scores, **all_metrics},
+                    output_dir
+                )
+
+
+            #  ────── save raw distributions and stats to JSON ──────
+            with open(os.path.join(output_dir, "open_ended_scores.json"), "w") as f:
+                json.dump(open_ended_scores, f, indent=2)
+
+            with open(os.path.join(output_dir, "open_ended_stats.json"), "w") as f:
+                json.dump(overall_results["open_ended_stats"], f, indent=2)
+            # ───────────────────────────────────────────────────────
+
 
             # Save overall summary
             with open(os.path.join(output_dir, "overall_evaluation_results.json"), "w") as f:
@@ -987,11 +1649,18 @@ def parse_args():
     parser.add_argument("--results_dir",
                     default="submission_output",
                     help="Folder that already contains the seven *.json files")
+    
+    parser.add_argument(
+        "--bin_width",
+        type=float,
+        default=0.05,
+        help="bin width for semantic‑similarity histograms (default: 0.05)"
+    )
 
 
     return parser.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
-    evaluator = ClinIQLinkSampleDatasetEvaluate(run_mode=args.mode, results_dir=args.results_dir)
+    evaluator = ClinIQLinkSampleDatasetEvaluate(run_mode=args.mode, results_dir=args.results_dir, bin_width=args.bin_width)
     evaluator.run_all_evaluations()

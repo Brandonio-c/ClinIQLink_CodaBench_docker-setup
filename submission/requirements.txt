@@ -4,6 +4,14 @@ scikit-learn
 sentence-transformers
 nltk
 rouge-score
-transformers # only required if using GPT-2 example
-torch
+transformers>=4.49.0
 accelerate
+protobuf>=4.21.0,<5
+einops
+sentencepiece
+safetensors       
+matplotlib        
+scipy
+# torch
+# flash-attn>=2.3.6       # fused attention kernels
+# xformers>=0.0.26        # fused MHA fallback for older GPUs
