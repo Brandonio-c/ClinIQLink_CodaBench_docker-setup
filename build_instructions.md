@@ -55,7 +55,7 @@ ClinIQLink_CodaBench_docker-setup/
 
 3. and once you have the forward inference results, then run the following for evaluation: 
    ```bash
-   python evaluate.py --results_dir submission_output --mode local
+   python evaluate.py --results_dir submission_output --mode local --bin_width 0.1
    ```
 
    This will execute the evaluation logic, using your model under `model_submissions/`.

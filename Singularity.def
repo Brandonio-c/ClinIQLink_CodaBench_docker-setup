@@ -1,47 +1,71 @@
 Bootstrap: docker
-From: python:3.10-slim
+From: pytorch/pytorch:2.1.2-cuda12.1-cudnn8-devel
 
 %labels
-    Maintainer "brandon.colelough@nih.gov"
+    Maintainer  "brandon.colelough@nih.gov"
     Description "ClinIQLink image for AI model submission and evaluation"
 
 %environment
+    export CUDA_HOME=/usr/local/cuda
     export NLTK_DATA=/usr/local/nltk_data
     export HF_HOME=/app/.cache/huggingface
     export TRANSFORMERS_CACHE=/app/.cache/transformers
     export TORCH_HOME=/app/.cache/torch
-
     export MODEL_DIR=/models
     export DATA_DIR=/data
     export OUTPUT_DIR=/results
-
     export USE_INTERNAL_MODEL=1
-    export RESULTS_PATH=/tmp/overall_evaluation_results.json
-    export MODE=submit  # Default mode
+    export MODE=submit   # default mode
 
 %post
-    # Install system dependencies and clean up
-    apt-get update && apt-get install -y \
+    # 1) System deps
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        tzdata \
         build-essential \
         git \
         wget \
         curl \
-        ca-certificates && \
-        rm -rf /var/lib/apt/lists/*
+        ca-certificates \
+        libopenmpi-dev \
+        libgomp1 && \
+    rm -rf /var/lib/apt/lists/*
 
-    # Create expected directories and ensure group/world read-write
-    mkdir -p /app /app/results $MODEL_DIR $DATA_DIR $OUTPUT_DIR $NLTK_DATA
+    # 2) Create dirs & set permissions
+    mkdir -p /app /app/results \
+             $MODEL_DIR $DATA_DIR $OUTPUT_DIR $NLTK_DATA \
+             /app/.cache/huggingface /app/.cache/transformers /app/.cache/torch /app/models
     chmod -R a+rwX /app $MODEL_DIR $DATA_DIR $OUTPUT_DIR $NLTK_DATA
 
-    # Upgrade pip + install Python dependencies
-    pip install --no-cache-dir --upgrade pip && \
-        pip install -r /app/requirements.txt
+    # 3) Upgrade pip
+    pip install --no-cache-dir --upgrade pip
 
-    # Preload NLTK punkt and sentence-transformers model
-    python -m nltk.downloader punkt punkt_tab -d $NLTK_DATA && \
-    python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', cache_folder='/app/models')"
+    # 4) Install GPU-specific wheels (CUDA 12.1, requires nvcc from devel image)
+    pip install --no-cache-dir \
+        bitsandbytes==0.41.1 \
+        faiss-gpu==1.7.2 && \
+    pip install --no-cache-dir \
+        flash-attn==2.3.6 \
+        -f https://flash-attn-builder.s3.us-east-2.amazonaws.com/whl/cu121/torch2.1/index.html && \
+    pip install --no-cache-dir \
+        xformers==0.0.26
 
-    # Ensure final permissions
+    # 5) Filter out overlaps, then install remaining requirements
+    grep -Ev '^(torch|flash-attn|xformers|bitsandbytes|faiss-gpu)' \
+         /app/requirements.txt > /tmp/req-filtered.txt
+    pip install --no-cache-dir -r /tmp/req-filtered.txt
+
+    # 6) Cache NLTK punkt models and MiniLM SentenceTransformer
+    python -m nltk.downloader punkt punkt_tab -d "$NLTK_DATA"
+    python - <<'EOF'
+from sentence_transformers import SentenceTransformer
+SentenceTransformer(
+    'sentence-transformers/all-MiniLM-L6-v2',
+    cache_folder='/app/models'
+)
+EOF
+
+    # 7) Final permissions
     chmod -R a+rwX /app $MODEL_DIR $DATA_DIR $OUTPUT_DIR $NLTK_DATA
 
 %files
