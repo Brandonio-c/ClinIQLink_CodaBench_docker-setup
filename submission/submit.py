@@ -3,8 +3,20 @@ import os
 import random
 import argparse
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, GenerationConfig
+import torch.distributed as dist
+from contextlib import suppress
 from transformers.pipelines import TextGenerationPipeline
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    AutoModelForSeq2SeqLM,
+    AutoModelForMaskedLM,
+    AutoModelForQuestionAnswering,
+    AutoModelForSequenceClassification,
+    pipeline,
+    GenerationConfig,
+)
 import re
 
 # Explicitly set HuggingFace & Torch cache paths for consistency and safety inside container
@@ -13,9 +25,14 @@ os.environ["TRANSFORMERS_CACHE"] = "/app/.cache/transformers"
 os.environ["TORCH_HOME"] = "/app/.cache/torch"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
+def is_main_process() -> bool:
+    return (not dist.is_available()
+            or not dist.is_initialized()
+            or dist.get_rank() == 0)
+
 class ClinIQLinkSampleDatasetSubmit:
     def __init__(self, run_mode="container", max_length=1028, sample_sizes=None, random_sample=False, chunk_size=2,
-                    do_sample=False, temperature=None, top_p=None, top_k=None):
+                    do_sample=False, temperature=None, top_p=None, top_k=None, distributed=False):
         self.run_mode = run_mode.lower()
         self.max_length = max_length
         self.sample_sizes = sample_sizes or {}
@@ -25,6 +42,8 @@ class ClinIQLinkSampleDatasetSubmit:
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
+        self.distributed = distributed
+        self._pipeline_task = ""
         if self.do_sample and (self.temperature is None or self.temperature <= 0):
             print("[WARN] --do_sample was set but temperature <=0; "
                 "setting temperature=0.7 for safety.", flush=True)
@@ -100,6 +119,14 @@ class ClinIQLinkSampleDatasetSubmit:
 
         return result
 
+    def _ensure_pad_token(self, tokenizer):
+        """Make sure tokenizer has a valid pad-token (needed before pipeline is built)."""
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
+            tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
+
+
+    
     def load_participant_model(self):
         """
         Dynamically loads the participant's LLM model from the 'model_submissions' directory.
@@ -141,31 +168,204 @@ class ClinIQLinkSampleDatasetSubmit:
                         torch_dtype = torch.float32
                         device_map = "auto"  # fallback to CPU
 
-                    model = AutoModelForCausalLM.from_pretrained(
-                        entry_path,
-                        trust_remote_code=True,
-                        use_safetensors=True,
-                        device_map=device_map,
-                        torch_dtype=torch_dtype
-                    )
-                    self.tokenizer = AutoTokenizer.from_pretrained(entry_path, trust_remote_code=True, padding=True, padding_side="left")
-                    print("Participant's Hugging Face model loaded successfully.", flush=True)
+                    # ---------------------------------------------------------------------
+                    # Pick the right HF head + tell the rest of the code which pipeline to
+                    # build.  Order matters: we exit on the *first* rule that matches.
+                    # ---------------------------------------------------------------------
+                    cfg = AutoConfig.from_pretrained(
+                            entry_path,
+                            trust_remote_code=True,
+                            local_files_only=True
+                        )
+                    auto_map = getattr(cfg, "auto_map", {}) or {}      # present in many custom repos
 
-                    if self.tokenizer.chat_template is None:
+                    LLAMA_FAMILY = {"llama", "llama2", "llama3", "llama4"}
+
+                    # 0) LLaMA and friends (all decoder‑only) as well as custom ones for some trouble architectures 
+                    if cfg.model_type in LLAMA_FAMILY:
+                        ModelClass       = AutoModelForCausalLM
+                        self._pipeline_task = "text-generation"
+                    
+                    elif cfg.model_type in {"albert", "albert_xlarge"}:
+                        ModelClass       = AutoModelForMaskedLM
+                        self._pipeline_task = "fill-mask"
+
+                    elif cfg.model_type.startswith("t5") or "flan" in cfg.model_type:
+                        ModelClass       = AutoModelForSeq2SeqLM
+                        self._pipeline_task = "text2text-generation"
+
+                    elif cfg.model_type == "clinical_mosaic" or "clinicalmosaic" in entry_path.lower():
+                        ModelClass       = AutoModelForSequenceClassification
+                        self._pipeline_task = "text-classification"
+
+                    # ─── handle Mistral-3 / Mixtral custom configs ───
+                    elif cfg.model_type == "mistral3":
+                        from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditionalGeneration
+                        ModelClass       = Mistral3ForConditionalGeneration
+                        self._pipeline_task = "text-generation"
+                        
+                    # ─── handle Mixtral and earlier Mistral families ───
+                    elif cfg.model_type in {"mixtral", "mistral"}:
+                        ModelClass       = AutoModelForCausalLM
+                        self._pipeline_task = "text-generation"
+
+                    # 1) Custom repositories that ship their own heads
+                    #    (ClinicalMosaic, future Gemma‑Flash, etc.)
+                    elif "AutoModelForSequenceClassification" in auto_map:
+                        ModelClass       = AutoModelForSequenceClassification
+                        self._pipeline_task = "text-classification"
+
+                    elif "AutoModelForMaskedLM" in auto_map:
+                        ModelClass       = AutoModelForMaskedLM
+                        self._pipeline_task = "fill-mask"
+
+                    # 2) Encoder‑decoder models (T5/BART/UL2/FLAN, …)
+                    elif getattr(cfg, "is_encoder_decoder", False):
+                        ModelClass       = AutoModelForSeq2SeqLM
+                        self._pipeline_task = "text2text-generation"
+
+                    # 3) Architectures list tells us exactly which head to use
+                    elif any(a.endswith("ForMaskedLM")           for a in getattr(cfg, "architectures", []) or []):
+                        ModelClass       = AutoModelForMaskedLM
+                        self._pipeline_task = "fill-mask"
+
+                    elif any(a.endswith("ForQuestionAnswering")  for a in getattr(cfg, "architectures", []) or []):
+                        ModelClass       = AutoModelForQuestionAnswering
+                        self._pipeline_task = "question-answering"
+
+                    elif any(a.endswith("ForSequenceClassification") for a in getattr(cfg, "architectures", []) or []):
+                        ModelClass       = AutoModelForSequenceClassification
+                        self._pipeline_task = "text-classification"
+
+
+                    # 4) Large decoder‑only families that don’t set is_decoder=True
+                    #    (Falcon‑3, Mistral‑24B, Mixtral, Qwen‑2, etc.)
+                    else:
+                        DECODER_ONLY = {
+                            # GPT style
+                            "gpt2", "gptj", "gpt_neo", "gpt_neox",
+                            # Meta / Mistral AI
+                            "llama", "llama2", "llama3", "llama4",
+                            "mistral", "mistral3",
+                            "mixtral",
+                            # Others
+                            "bloom", "gemma",
+                            "falcon", "falcon2", "falcon3",
+                            "qwen", "qwen2",
+                            "mpt"
+                        }
+                        if getattr(cfg, "is_decoder", False) or cfg.model_type in DECODER_ONLY:
+                            ModelClass       = AutoModelForCausalLM
+                            self._pipeline_task = "text-generation"
+                        else:
+                            print(f"[WARN] Unknown model_type '{cfg.model_type}', falling back to causal‑LM.", flush=True)
+                            ModelClass       = AutoModelForCausalLM
+                            self._pipeline_task = "text-generation"
+
+                    # Final guard – if *anything* above forgot to set a task
+                    if not self._pipeline_task:
+                        self._pipeline_task = "text-generation"
+                    
+                    # === Load model, preferring safetensors but falling back to PyTorch .bin ===
+
+                    #added in as mistral / mixtral was slow 
+                    extra_model_kwargs = {}
+                    if cfg.model_type in {"mistral", "mixtral", "mistral3"}:
+                        extra_model_kwargs["attn_implementation"] = "flash_attention_2"
+                        torch.backends.cuda.matmul.allow_tf32 = True       # A100/H100 TF32 paths
+                        torch.set_float32_matmul_precision("high")         # PyTorch ≥2.0
+                        rope_scaling="dynamic"                     # avoids re‑alloc in long prompts
+
+                    elif cfg.model_type in {
+                        "llama", "llama2", "llama3", "llama4",
+                        "mistral", "mixtral",
+                        "granite", "dbrx",
+                        "falcon", "gemma",
+                        "phi", "phi2", "phi3",
+                        "qwen2", "qwen2moe",
+                        "stablelm", "starcoder2"
+                    }:
+                        extra_model_kwargs["attn_implementation"] = "flash_attention_2"
+                        # enable TF32 matmuls on A100/H100
+                        torch.backends.cuda.matmul.allow_tf32 = True
+                        # PyTorch≥2.0 high-precision TF32
+                        torch.set_float32_matmul_precision("high")
+
+                        
+                    try:
+                        model = ModelClass.from_pretrained(
+                            entry_path,
+                            trust_remote_code=True,
+                            use_safetensors=True,
+                            device_map=device_map,
+                            torch_dtype=torch_dtype,
+                            local_files_only=True,
+                            **extra_model_kwargs, 
+                        )
+                        print(f"[INFO] Loaded model from {entry_path} with safetensors.", flush=True)
+
+                    except Exception as e:
+                        err_str = str(e).lower()
+
+                        # Detect the common “no safetensors found” failure
+                        if "safetensors" in err_str:
+                            print(f"[WARN] No safetensors weights at {entry_path}; retrying with use_safetensors=False", flush=True)
+
+                            # Retry with standard PyTorch weights
+                            model = ModelClass.from_pretrained(
+                                entry_path,
+                                trust_remote_code=True,
+                                use_safetensors=False,
+                                device_map=device_map,
+                                torch_dtype=torch_dtype,
+                                local_files_only=True
+                            )
+                            print(f"[INFO] Loaded model from {entry_path} with PyTorch .bin weights.", flush=True)
+
+                        else:
+                            # Some other error: propagate with context
+                            print(f"Unrecognised / unsupported model type '{cfg.model_type}'. "
+                                    "Add an appropriate head mapping in load_participant_model().")
+                            raise RuntimeError(f"Failed to load model at {entry_path}: {e}") from e
+                    
+                    try:
+                        self.tokenizer = AutoTokenizer.from_pretrained(
+                            entry_path,
+                            trust_remote_code=True,
+                            padding_side="left",
+                            use_fast=True,
+                        )
+                    except Exception as e:
+                        print(f"[WARN] fast tokenizer failed: {e} – retrying with use_fast=False", flush=True)
+                        self.tokenizer = AutoTokenizer.from_pretrained(
+                            entry_path,
+                            trust_remote_code=True,
+                            padding_side="left",
+                            use_fast=False,
+                        )
+
+                    self._ensure_pad_token(self.tokenizer)
+                    model.config.pad_token_id = self.tokenizer.pad_token_id
+                    if hasattr(model, "generation_config"):
+                        model.generation_config.pad_token_id = self.tokenizer.pad_token_id
+                    print("Participant's Hugging Face model loaded successfully.", flush=True)
+                    print(f"Loaded {cfg.model_type} as {ModelClass.__name__} + task='{self._pipeline_task}'", flush=True)
+
+                    # optional chat_template for LLaMA-like chat models
+                    if getattr(self.tokenizer, "chat_template", None) is None and "llama" in cfg.model_type:
                         print("Setting manual chat template for LLaMA tokenizer...", flush=True)
                         self.tokenizer.chat_template = (
                             "{% for message in messages %}"
-                            "{% if message['role'] == 'system' %}"
+                            "{% if message['role']=='system' %}"
                             "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
                             "{{ message['content'] }}<|eot_id|>"
-                            "{% elif message['role'] == 'user' %}"
+                            "{% elif message['role']=='user' %}"
                             "<|start_header_id|>user<|end_header_id|>\n"
                             "{{ message['content'] }}<|eot_id|>"
-                            "{% elif message['role'] == 'assistant' %}"
+                            "{% elif message['role']=='assistant' %}"
                             "<|start_header_id|>assistant<|end_header_id|>\n"
                             "{{ message['content'] }}<|eot_id|>"
-                            "{% endif %}"
-                            "{% endfor %}"
+                            "{% endif %}{% endfor %}"
                             "<|start_header_id|>assistant<|end_header_id|>\n"
                         )
 
@@ -198,6 +398,7 @@ class ClinIQLinkSampleDatasetSubmit:
                         if os.path.isdir(fallback_tokenizer_path):
                             try:
                                 self.tokenizer = AutoTokenizer.from_pretrained(fallback_tokenizer_path, padding_side="left")
+                                self._ensure_pad_token(self.tokenizer)
                                 print(f"Tokenizer loaded from fallback path: {fallback_tokenizer_path}", flush=True)
                             except Exception as e:
                                 print(f"Failed to load tokenizer from fallback path: {e}", flush=True)
@@ -222,6 +423,7 @@ class ClinIQLinkSampleDatasetSubmit:
                         if os.path.isdir(fallback_tokenizer_path):
                             try:
                                 self.tokenizer = AutoTokenizer.from_pretrained(fallback_tokenizer_path, padding_side="left")
+                                self._ensure_pad_token(self.tokenizer)
                                 print(f"Tokenizer loaded from fallback path: {fallback_tokenizer_path}", flush=True)
                             except Exception as e:
                                 print(f"Failed to load tokenizer from fallback path: {e}", flush=True)
@@ -267,29 +469,41 @@ class ClinIQLinkSampleDatasetSubmit:
             # Case 1: Hugging Face Transformer Model
             if os.path.isdir(entry_path) and "config.json" in os.listdir(entry_path):
                 print(f"Loading Hugging Face model from: {entry_path}", flush=True)
+
+                # build the kwargs for whichever pipeline we're about to create
+                pipeline_kwargs = {
+                    "model":      self.model,
+                    "tokenizer":  self.tokenizer,
+                    "batch_size": self.chunk_size,
+                }
+
+                # generation pipelines get full control over sampling / length
+                if self._pipeline_task in ("text-generation", "text2text-generation"):
+                    pipeline_kwargs.update({
+                        "max_length": self.max_length,
+                        "truncation": True,
+                        "do_sample":  self.do_sample,
+                        "temperature": self.temperature,
+                        "top_p":       self.top_p,
+                        "top_k":       self.top_k,
+                    })
+
+                # fill-mask only supports mask-specific args (e.g. top_k)
+                elif self._pipeline_task == "fill-mask":
+                    if self.top_k is not None:
+                        pipeline_kwargs["top_k"] = self.top_k
+
+                # classification & QA just need truncation
+                else:
+                    pipeline_kwargs["truncation"] = True
+
                 try:
-                    _pipeline = pipeline(
-                        "text-generation",
-                        model      = self.model,
-                        tokenizer  = self.tokenizer,
-                        batch_size = self.chunk_size,
-                        max_length = self.max_length,
-                        truncation = True,
-                        do_sample  = self.do_sample,
-                        temperature= self.temperature,
-                        top_p      = self.top_p,
-                        top_k      = self.top_k,
-                    )
-
-                    # Safely set pad_token if missing
-                    if _pipeline.tokenizer.pad_token is None:
-                        print("Tokenizer missing pad_token; setting it to eos_token", flush=True)
-                        _pipeline.tokenizer.pad_token = _pipeline.tokenizer.eos_token
-                        _pipeline.tokenizer.pad_token_id = _pipeline.tokenizer.eos_token_id
-
+                    _pipeline = pipeline(self._pipeline_task, **pipeline_kwargs)
+                    self._ensure_pad_token(_pipeline.tokenizer)
                     return _pipeline
                 except Exception as e:
                     print(f"Failed to load Hugging Face pipeline: {e}", flush=True)
+
 
             # Case 2: PyTorch Model Checkpoint
             elif entry.endswith(".pt") or entry.endswith(".pth"):
@@ -321,6 +535,32 @@ class ClinIQLinkSampleDatasetSubmit:
         print("Error: No valid model found in 'model_submissions'.", flush=True)
         return None
 
+    def participant_model(self, prompt, qa_type=None):
+        if not self.pipeline:
+            return "ERROR: No pipeline loaded"
+
+        try:
+            # HuggingFace pipelines auto-handle list vs str input
+            outputs = self.pipeline(prompt)
+            if isinstance(outputs, list):
+                if self._pipeline_task in ["text-generation", "text2text-generation"]:
+                    return [o["generated_text"] if "generated_text" in o else o["text"] for o in outputs]
+                elif self._pipeline_task == "fill-mask":
+                    return [o[0]["token_str"] for o in outputs]  # top prediction
+                elif self._pipeline_task in ["text-classification", "question-answering"]:
+                    return [o["label"] if "label" in o else o["answer"] for o in outputs]
+                else:
+                    return outputs
+            elif isinstance(outputs, dict):
+                return outputs.get("answer") or outputs.get("label") or outputs.get("text") or str(outputs)
+            else:
+                return str(outputs)
+
+        except Exception as e:
+            print(f"Error in participant_model(): {e}", flush=True)
+            return "ERROR DURING INFERENCE"
+
+    
     def load_json(self, filepath):
         """
         Load JSON data from the specified file.
@@ -497,7 +737,8 @@ class ClinIQLinkSampleDatasetSubmit:
                         add_generation_prompt=True,
                         return_tensors="pt",
                         padding=True,
-                        truncation=True
+                        truncation=True,
+                        max_length=self.max_length,
                     ).to(self.model.device)
                 else:
                     conversations = [
@@ -507,8 +748,15 @@ class ClinIQLinkSampleDatasetSubmit:
                     inputs = self.tokenizer.apply_chat_template(
                         conversations,
                         add_generation_prompt=True,
-                        return_tensors="pt"
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=self.max_length,
                     ).to(self.model.device)
+
+                # unpack both tensors
+                input_ids = inputs["input_ids"]
+                attention_mask = inputs["attention_mask"]
 
                 eot_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
                 gen_cfg = GenerationConfig(
@@ -530,7 +778,16 @@ class ClinIQLinkSampleDatasetSubmit:
                         pad_token_id   = self.tokenizer.eos_token_id,
                     )
 
-                output_ids = self.model.generate(inputs, generation_config=gen_cfg)
+                attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
+                output_ids = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    generation_config=gen_cfg,
+                    #max_length=self.max_length,
+                    max_new_tokens=gen_cfg.max_new_tokens,  #added as mistral / mixtral was extremely slow 
+                    pad_token_id=self.tokenizer.pad_token_id
+                )
+
                 response = self.tokenizer.batch_decode(
                     output_ids[:, inputs.shape[-1]:], skip_special_tokens=True
                 )
@@ -540,12 +797,31 @@ class ClinIQLinkSampleDatasetSubmit:
             # Handle PyTorch models directly
             elif hasattr(self.model, "generate"):
                 if isinstance(prompt, list):
-                    input_ids = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)["input_ids"]
+                    input_ids = self.tokenizer(
+                        prompt,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=self.max_length,  
+                    )["input_ids"]
                 else:
-                    input_ids = self.tokenizer(prompt, return_tensors="pt")["input_ids"]
+                    input_ids = self.tokenizer(
+                        prompt,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=self.max_length,  
+                    )["input_ids"]
+
                 input_ids = input_ids.to(self.model.device)
                 with torch.no_grad():
-                    output_ids = self.model.generate(input_ids, max_length=self.max_length)
+                    attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
+                    output_ids = self.model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        # max_length=self.max_length,
+                        max_new_tokens=gen_cfg.max_new_tokens,  #added as mistral / mixtral was extremely slow 
+                        pad_token_id=self.tokenizer.pad_token_id
+                    )
                 response = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
                 response = response if isinstance(prompt, list) else response[0]
 
@@ -850,12 +1126,31 @@ class ClinIQLinkSampleDatasetSubmit:
             for qa_type, submit_fn in qa_types.items():
                 print(f"Running inference for: {qa_type}", flush=True)
                 result = submit_fn()
-                output_path = os.path.join(output_dir, f"{qa_type}.json")
-                with open(output_path, "w") as f:
-                    json.dump(result, f, indent=4)
-                print(f"Saved {qa_type} results to {output_path}", flush=True)
 
-            print(f"All inference outputs saved to separate JSON files in {output_dir}", flush=True)
+                output_path = os.path.join(output_dir, f"{qa_type}.json")
+                if self.distributed:
+                    if is_main_process():
+                        with open(output_path, "w") as f:
+                            json.dump(result, f, indent=4)
+                        print(f"Saved {qa_type} results to {output_path}", flush=True)
+
+                    if is_main_process():
+                        print(f"All inference outputs saved to separate JSON files in {output_dir}", flush=True)
+
+                else:
+                    with open(output_path, "w") as f:
+                        json.dump(result, f, indent=4)
+                    print(f"Saved {qa_type} results to {output_path}", flush=True)
+
+            if self.distributed:
+                if dist.is_initialized():
+                        dist.barrier()
+
+            if self.distributed:
+                if is_main_process():
+                    print(f"[DONE] All outputs in {output_dir}", flush=True)
+            else:
+                print(f"All inference outputs saved to separate JSON files in {output_dir}", flush=True)
 
         except Exception as e:
             print(f"Error running all submissions: {e}", flush=True)
@@ -898,7 +1193,39 @@ def parse_args():
     parser.add_argument("--top_k",       type=int,   default=None,
                         help="Top-k sampling (integer)")
     
+    parser.add_argument(
+        "--local_rank", type=int, default=os.environ.get("LOCAL_RANK", 0),
+        help="Local rank passed by torchrun"
+    )
+
+    parser.add_argument(
+        "--distributed",
+        action="store_true",
+        help="Enable torch.distributed (multi-GPU / multi-node via torchrun or SLURM) (launch with torchrun or srun –ntasks>1"
+    )
+
+    
     return parser.parse_args()
+
+
+def init_distributed(local_rank: int):
+    """
+    Initialise torch.distributed if launched with --distributed.
+    """
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed is not available.")
+    if dist.is_initialized():
+        print("[WARN] torch.distributed already initialized.", flush=True)
+        return
+    if "RANK" not in os.environ:
+        raise RuntimeError("Distributed mode requested but RANK env var not found. Are you using torchrun or SLURM with srun?")
+    
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    dist.init_process_group(backend=backend, init_method="env://")
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    print(f"[Distributed] Initialized rank {dist.get_rank()}/{dist.get_world_size()} on device {torch.cuda.current_device()}", flush=True)
+
 
 if __name__ == "__main__":
     args = parse_args()
@@ -912,6 +1239,11 @@ if __name__ == "__main__":
         "num_multi_inv": args.num_multi_inv,
     }
 
+
+    if args.distributed:
+        init_distributed(args.local_rank)
+
+
     submit = ClinIQLinkSampleDatasetSubmit(
         run_mode      = args.mode,
         max_length    = args.max_length,
@@ -922,5 +1254,6 @@ if __name__ == "__main__":
         temperature = args.temperature,
         top_p       = args.top_p,
         top_k       = args.top_k,
+        distributed = args.distributed,
     )
     submit.run_all_submissions()
