@@ -1,19 +1,19 @@
 # -----------------------------------------------------------------------------
-# Base: CUDA 12.1 / cuDNN 8 / PyTorch 2.1.2 / Python 3.10 (with nvcc)
+# Base: CUDA 12.1 / cuDNN 9 / PyTorch 2.5.1 / Python 3.10 (with nvcc)
 # -----------------------------------------------------------------------------
-    FROM pytorch/pytorch:2.1.2-cuda12.1-cudnn8-devel
+FROM pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel
+
 
 LABEL maintainer="brandon.colelough@nih.gov"
 LABEL description="ClinIQLink Docker image for AI model submission and evaluation"
 
-# so pip/setuptools can find CUDA
-ENV CUDA_HOME=/usr/local/cuda
-
 # -----------------------------------------------------------------------------
 # 1. Non-interactive APT
 # -----------------------------------------------------------------------------
-ARG DEBIAN_FRONTEND=noninteractive
-ENV DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC
+ENV CUDA_HOME=/usr/local/cuda \
+    DEBIAN_FRONTEND=noninteractive \
+    TZ=Etc/UTC \
+    PATH=/opt/conda/bin:$PATH
 
 # -----------------------------------------------------------------------------
 # 2. System packages
@@ -28,9 +28,16 @@ RUN apt-get update && \
         curl \
         ca-certificates \
         libopenmpi-dev \
-        libgomp1 && \
+        libgomp1 \
+        python3 \
+        python3-pip \
+        python3-dev \
+        ninja-build && \
     rm -rf /var/lib/apt/lists/*
 
+
+RUN python3 -m pip install --no-cache-dir \
+    --upgrade pip setuptools wheel packaging
 # -----------------------------------------------------------------------------
 # 3. Working directory & caches
 # -----------------------------------------------------------------------------
@@ -53,29 +60,40 @@ RUN mkdir -p \
     chmod -R a+rwX /app $MODEL_DIR $DATA_DIR $OUTPUT_DIR $NLTK_DATA
 
 # -----------------------------------------------------------------------------
+# 4. GPU-enabled FAISS from conda
+# -----------------------------------------------------------------------------
+RUN conda install -y -c pytorch \
+    faiss-gpu=1.7.2 \
+    && conda clean -afy
+
+# -----------------------------------------------------------------------------
 # 4. GPU‑specific Python wheels — **built for CUDA 12.1**
 # -----------------------------------------------------------------------------
-RUN pip install --no-cache-dir \
-    bitsandbytes==0.41.1 \
-    faiss-gpu==1.7.2         # official cu121 wheel
+# install bitsandbytes (from PyPI) and faiss-gpu
+RUN python3 -m pip install --no-cache-dir \
+        bitsandbytes==0.41.1 
+
 
 # -----------------------------------------------------------------------------
 # 5. Pure‑Python project dependencies
 # -----------------------------------------------------------------------------
-# Install Flash-Attention from the pre-built cu121 wheel
+
+# Install Flash-Attention from the pre-built cu121 wheel (for torch>=2.6.1)
 RUN pip install --no-cache-dir \
-flash-attn==2.3.6 \
--f https://flash-attn-builder.s3.us-east-2.amazonaws.com/whl/cu121/torch2.1/index.html
+        flash-attn==2.7.4.post1 \
+        -f https://flash-attn-builder.s3.us-east-2.amazonaws.com/whl/cu121/torch2.6/index.html
 
 
 COPY submission/requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r /app/requirements.txt
+RUN python3 -m pip install --no-cache-dir --upgrade pip && \
+    python3 -m pip install --no-cache-dir -r /app/requirements.txt
+
+RUN python3 -m pip install --no-cache-dir --upgrade transformers accelerate
 
 # -----------------------------------------------------------------------------
 # 6. Cache small NLP assets
 # -----------------------------------------------------------------------------
-RUN python -m nltk.downloader punkt punkt_tab -d "$NLTK_DATA" && \
+RUN python3 -m nltk.downloader punkt punkt_tab -d "$NLTK_DATA" && \
 python - <<EOF
 from sentence_transformers import SentenceTransformer
 SentenceTransformer(

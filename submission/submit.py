@@ -18,6 +18,11 @@ from transformers import (
     GenerationConfig,
 )
 import re
+try:
+    import flash_attn
+    flash_installed = True
+except ImportError:
+    flash_installed = False
 
 # Explicitly set HuggingFace & Torch cache paths for consistency and safety inside container
 os.environ["HF_HOME"] = "/app/.cache/huggingface"
@@ -43,6 +48,8 @@ class ClinIQLinkSampleDatasetSubmit:
         self.top_p = top_p
         self.top_k = top_k
         self.distributed = distributed
+        self.eos_id = None
+        self.model_type = None
         self._pipeline_task = ""
         if self.do_sample and (self.temperature is None or self.temperature <= 0):
             print("[WARN] --do_sample was set but temperature <=0; "
@@ -61,9 +68,10 @@ class ClinIQLinkSampleDatasetSubmit:
         self.dataset_dir = os.getenv("DATA_DIR", os.path.join(self.base_dir, "../data"))
         self.template_dir = os.path.join(self.base_dir, "submission_template")
 
-        # Placeholder: load the participant's LLM model and inference pipeline.
         self.model = self.load_participant_model()
+
         self.pipeline = self.load_participant_pipeline()
+
         # Load and sample the dataset
         self.sampled_qa_pairs = self.load_and_sample_dataset()
         self.SYSTEM_MSG = (
@@ -126,6 +134,348 @@ class ClinIQLinkSampleDatasetSubmit:
             tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
 
 
+    def infer_model_type_from_config(self, cfg) -> str:
+        """
+        Normalize and map AutoConfig.model_type to a high-level model type string.
+        """
+        model_type = cfg.model_type.lower()
+
+        # Map known model types to standardized categories
+        if model_type.startswith("llama"):
+            return "llama"
+        elif model_type.startswith("mistral"):
+            return "mistral"
+        elif model_type.startswith("mixtral"):
+            return "mixtral"
+        elif model_type.startswith("falcon"):
+            return "falcon"
+        elif model_type.startswith("qwen"):
+            return "qwen"
+        elif model_type.startswith("phi"):
+            return "phi"
+        elif model_type in {"vicuna", "koala", "wizard", "openchat"}:
+            return "vicuna"
+        elif model_type in {"gptj", "gpt_neox", "gpt2"}:
+            return "gpt"
+        elif model_type.startswith("t5") or "flan" in model_type or "ul2" in model_type:
+            return "t5"
+        elif model_type.startswith("bert") or "roberta" in model_type or "deberta" in model_type:
+            return "bert"
+        elif model_type.startswith("albert"):
+            return "albert"
+        elif "mpt" in model_type:
+            return "mpt"
+        elif "bloom" in model_type:
+            return "bloom"
+        elif "chatglm" in model_type:
+            return "chatglm"
+        elif "claude" in model_type or "anthropic" in model_type:
+            return "claude"
+        elif "clinicalmosaic" in model_type:
+            return "clinicalmosaic"
+
+        return "unknown"
+
+    
+    def set_eos_id(self, model_type: str):
+        """
+        Given a model_type key, pick the correct end‑of‑sequence token,
+        ensure the tokenizer knows about it, and save its ID as self.eos_id.
+        """
+        # 1) Define the family → EOS-token map
+        eos_map = {
+            "llama":   "<|eot_id|>",
+            "vicuna":  "</s>",
+            "falcon":  "</s>",
+            "mistral": "</s>",
+            "mixtral": "</s>",
+            "qwen":    "<|endoftext|>",
+            "gpt":     "",            # GPT‑2 uses default eos_token
+            "phi":     "</s>",
+            "claude":  "",            # default eos_token
+            # extend as you add new model families…
+        }
+
+        # 2) Pick your token string (fall back to tokenizer.eos_token)
+        token_str = eos_map.get(model_type.lower(), None) or self.tokenizer.eos_token
+        if token_str is None:
+            raise ValueError(f"No EOS token known for model_type={model_type}")
+
+        # 3) If it's not already in vocab, register it as the eof special token
+        if token_str not in self.tokenizer.get_vocab():
+            self.tokenizer.add_special_tokens({"eos_token": token_str})
+            # if your model needs resized embeddings:
+            try:
+                self.model.resize_token_embeddings(len(self.tokenizer))
+            except AttributeError:
+                pass
+
+        # 4) Lookup and stash the ID
+        self.eos_id = self.tokenizer.convert_tokens_to_ids(token_str)
+        # sync the tokenizer attributes
+        self.tokenizer.eos_token = token_str
+        self.tokenizer.eos_token_id = self.eos_id
+
+    
+    def get_chat_template_string(self, model_path_or_id: str) -> str:
+        model_id = model_path_or_id.lower()
+
+        # === Meta LLaMA 2 / 3 / 4 ===
+        if "llama" in model_id:
+            return (
+                # "<|begin_of_text|>"
+                # "{% for message in messages %}"
+                # "{% if message['role'] == 'system' %}"
+                # "<|start_header_id|>system<|end_header_id|>\n{{ message['content'] }}<|eot_id|>"
+                # "{% elif message['role'] == 'user' %}"
+                # "<|start_header_id|>user<|end_header_id|>\n{{ message['content'] }}<|eot_id|>"
+                # "{% elif message['role'] == 'assistant' %}"
+                # "<|start_header_id|>assistant<|end_header_id|>\n{{ message['content'] }}<|eot_id|>"
+                # "{% endif %}"
+                # "{% endfor %}"
+                # "<|start_header_id|>assistant<|end_header_id|>\n"
+
+                "{% for message in messages %}"
+                "{% if message['role']=='system' %}"
+                "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
+                "{{ message['content'] }}<|eot_id|>"
+                "{% elif message['role']=='user' %}"
+                "<|start_header_id|>user<|end_header_id|>\n"
+                "{{ message['content'] }}<|eot_id|>"
+                "{% elif message['role']=='assistant' %}"
+                "<|start_header_id|>assistant<|end_header_id|>\n"
+                "{{ message['content'] }}<|eot_id|>"
+                "{% endif %}{% endfor %}"
+                "<|start_header_id|>assistant<|end_header_id|>\n"   
+            )
+
+        # === Mistral / Mixtral ===
+        elif "mistral" in model_id or "mixtral" in model_id:
+            return (
+                "{% for message in messages %}"
+                "{% if message['role'] == 'system' %}"
+                "<s>[INST] <<SYS>>\n{{ message['content'] }}\n<</SYS>>\n"
+                "{% elif message['role'] == 'user' %}"
+                "{{ message['content'] }} [/INST] "
+                "{% elif message['role'] == 'assistant' %}"
+                "{{ message['content'] }}</s>\n"
+                "{% endif %}"
+                "{% endfor %}"
+                "<s>[INST] "
+            )
+
+        # === Qwen-style ===
+        elif "qwen" in model_id:
+            return (
+                "{% for message in messages %}"
+                "{% if message['role'] == 'system' %}"
+                "<|im_start|>system\n{{ message['content'] }}<|im_end|>\n"
+                "{% elif message['role'] == 'user' %}"
+                "<|im_start|>user\n{{ message['content'] }}<|im_end|>\n"
+                "{% elif message['role'] == 'assistant' %}"
+                "<|im_start|>assistant\n{{ message['content'] }}<|im_end|>\n"
+                "{% endif %}"
+                "{% endfor %}"
+                "<|im_start|>assistant\n"
+            )
+
+        # === Claude-style ===
+        elif "claude" in model_id or "anthropic" in model_id:
+            return (
+                "{% for message in messages %}"
+                "{% if message['role'] == 'user' %}"
+                "\\n\\nHuman: {{ message['content'] }}"
+                "{% elif message['role'] == 'assistant' %}"
+                "\\n\\nAssistant: {{ message['content'] }}"
+                "{% endif %}"
+                "{% endfor %}"
+                "\\n\\nAssistant:"
+            )
+
+        # === Vicuna / GPT-style ===
+        elif any(k in model_id for k in ["vicuna", "gpt", "koala", "openchat"]):
+            return (
+                "{% for message in messages %}"
+                "{{ message['role'].capitalize() }}: {{ message['content'] }}\n"
+                "{% endfor %}"
+                "Assistant: "
+            )
+
+        # === Falcon-style fallback ===
+        elif "falcon" in model_id or "deepseek" in model_id or "phi" in model_id:
+            return (
+                "{% for message in messages %}"
+                "[{{ message['role'].upper() }}]: {{ message['content'] }}\n"
+                "{% endfor %}"
+                "[ASSISTANT]: "
+            )
+
+        # === Default fallback ===
+        else:
+            return (
+                "{% for message in messages %}"
+                "{{ message['role'] }}: {{ message['content'] }}\n"
+                "{% endfor %}"
+                "assistant: "
+            )
+
+    
+    def apply_chat_template(self, tokenizer, messages, model_type=None, fallback_role="assistant", add_generation_prompt=True, max_length=2048):
+        """
+        Applies an appropriate chat-style prompt format based on the model's name or type.
+
+        Args:
+            tokenizer: HuggingFace tokenizer.
+            messages: List of message dicts (each with 'role' and 'content').
+            model_type: Optional model family name (inferred if not set).
+            fallback_role: Role to use for generation prompt if needed.
+            add_generation_prompt: Whether to add an empty assistant turn at the end.
+            max_length: Max length for tokenizer truncation.
+
+        Returns:
+            input_ids suitable for model.generate()
+        """
+
+        if not messages:
+            raise ValueError("`messages` must be a non-empty list of dicts.")
+
+        model_id = (model_type or getattr(tokenizer, "name_or_path", "")).lower()
+
+        # === Meta LLaMA 2 / 3 / 4 ===
+        if "llama" in model_id:
+            template = ("<|begin_of_text|>"
+                        "{% for message in messages %}"
+                        "{% if message['role'] == 'system' %}"
+                        "<|start_header_id|>system<|end_header_id|>\n{{ message['content'] }}<|eot_id|>"
+                        "{% elif message['role'] == 'user' %}"
+                        "<|start_header_id|>user<|end_header_id|>\n{{ message['content'] }}<|eot_id|>"
+                        "{% elif message['role'] == 'assistant' %}"
+                        "<|start_header_id|>assistant<|end_header_id|>\n{{ message['content'] }}<|eot_id|>"
+                        "{% endif %}"
+                        "{% endfor %}")
+            if add_generation_prompt:
+                template += "<|start_header_id|>assistant<|end_header_id|>\n"
+            # Render manually since we don't have Jinja2
+            rendered = ""
+            for m in messages:
+                role = m["role"]
+                content = m["content"].strip()
+                rendered += f"<|start_header_id|>{role}<|end_header_id|>\n{content}<|eot_id|>\n"
+            if add_generation_prompt:
+                rendered += f"<|start_header_id|>{fallback_role}<|end_header_id|>\n"
+            return tokenizer(rendered.strip(), return_tensors="pt", truncation=True, max_length=max_length)["input_ids"]
+
+        # === Mistral / Mixtral ===
+        elif "mistral" in model_id or "mixtral" in model_id:
+            template = ""
+            for m in messages:
+                role = m["role"]
+                content = m["content"].strip()
+                if role == "system":
+                    template += f"<s>[INST] <<SYS>>\n{content}\n<</SYS>>\n"
+                elif role == "user":
+                    template += f"{content} [/INST] "
+                elif role == "assistant":
+                    template += f"{content}</s>\n"
+            if add_generation_prompt:
+                template += "<s>[INST] "
+            return tokenizer(template.strip(), return_tensors="pt", truncation=True, max_length=max_length)["input_ids"]
+
+        # === Falcon / Phi / Qwen / DeepSeek (shared format) ===
+        elif any(k in model_id for k in ["falcon", "phi", "qwen", "deepseek"]):
+            template = ""
+            for m in messages:
+                role = m["role"].upper()
+                content = m["content"].strip()
+                template += f"[{role}]: {content}\n"
+            if add_generation_prompt:
+                template += "[ASSISTANT]: "
+            return tokenizer(template.strip(), return_tensors="pt", truncation=True, max_length=max_length)["input_ids"]
+
+        # === Vicuna ===
+        elif "vicuna" in model_id:
+            template = ""
+            for m in messages:
+                role = m["role"]
+                content = m["content"].strip()
+                template += f"### {role.capitalize()}:\n{content}\n"
+            if add_generation_prompt:
+                template += "### Assistant:\n"
+            return tokenizer(template.strip(), return_tensors="pt", truncation=True, max_length=max_length)["input_ids"]
+
+        # === Claude-like ===
+        elif any(k in model_id for k in ["claude", "anthropic"]):
+            template = ""
+            for m in messages:
+                if m["role"] == "user":
+                    template += f"\n\nHuman: {m['content'].strip()}"
+                elif m["role"] == "assistant":
+                    template += f"\n\nAssistant: {m['content'].strip()}"
+            if add_generation_prompt:
+                template += "\n\nAssistant:"
+            return tokenizer(template.strip(), return_tensors="pt", truncation=True, max_length=max_length)["input_ids"]
+
+        # === Koala / GPT-J / GPT-NeoX fallback ===
+        elif any(k in model_id for k in ["gpt", "openchat", "koala", "wizard"]):
+            template = ""
+            for m in messages:
+                template += f"{m['role'].capitalize()}: {m['content'].strip()}\n"
+            if add_generation_prompt:
+                template += "Assistant: "
+            return tokenizer(template.strip(), return_tensors="pt", truncation=True, max_length=max_length)["input_ids"]
+
+        # === Default fallback ===
+        else:
+            template = "\n\n".join(m["content"].strip() for m in messages if m["role"] in {"system", "user"})
+            if add_generation_prompt:
+                template += f"\n\n{fallback_role.capitalize()}:"
+            return tokenizer(template.strip(), return_tensors="pt", truncation=True, max_length=max_length)["input_ids"]
+    
+    def load_participant_tokenizer(self, padding_side):
+        """Load tokenizer from a directory with fallback for non-fast versions."""
+        if self.run_mode == "local":
+            model_submissions_dir = os.path.join(self.base_dir, "../model_submission")
+        else:
+            model_dir_env = os.getenv("USE_INTERNAL_MODEL", "1").strip().lower()
+            if model_dir_env in ["1", "true", "yes"]:
+                model_submissions_dir = os.path.join(self.base_dir, "model_submission/snapshots")
+            else:
+                model_submissions_dir = os.path.join(self.base_dir, "model_submission/snapshots")
+        
+        if not os.path.exists(model_submissions_dir):
+            raise FileNotFoundError(f"[Tokenizer] No 'model_submissions' folder at {model_submissions_dir}")
+
+
+        for entry in os.listdir(model_submissions_dir):
+            entry_path = os.path.join(model_submissions_dir, entry)
+            if os.path.isdir(entry_path) and "config.json" in os.listdir(entry_path):
+                try:
+                    self.tokenizer = AutoTokenizer.from_pretrained(
+                        entry_path,
+                        trust_remote_code=True,
+                        padding_side=padding_side,
+                        use_fast=True,
+                    )
+                    self._ensure_pad_token(self.tokenizer)
+                    print(f"[Tokenizer] Loaded from {entry_path}", flush=True)
+                    return  # Success
+                except Exception as e:
+                    print(f"[WARN] fast tokenizer failed: {e} – retrying with use_fast=False", flush=True)
+                    self.tokenizer = AutoTokenizer.from_pretrained(
+                        entry_path,
+                        trust_remote_code=True,
+                        padding_side=padding_side,
+                        use_fast=False,
+                    )
+                    self._ensure_pad_token(self.tokenizer)
+                    print(f"[Tokenizer] Loaded (slow) from {entry_path}", flush=True)
+                    return
+                
+                except Exception as e2:
+                    print(f"[Tokenizer] Failed loading tokenizer from {entry_path}: {e2}", flush=True)
+
+        raise RuntimeError("[Tokenizer] No valid tokenizer found in model_submissions.")
+    
     
     def load_participant_model(self):
         """
@@ -177,6 +527,8 @@ class ClinIQLinkSampleDatasetSubmit:
                             trust_remote_code=True,
                             local_files_only=True
                         )
+
+
                     auto_map = getattr(cfg, "auto_map", {}) or {}      # present in many custom repos
 
                     LLAMA_FAMILY = {"llama", "llama2", "llama3", "llama4"}
@@ -270,15 +622,9 @@ class ClinIQLinkSampleDatasetSubmit:
 
                     #added in as mistral / mixtral was slow 
                     extra_model_kwargs = {}
-                    if cfg.model_type in {"mistral", "mixtral", "mistral3"}:
-                        extra_model_kwargs["attn_implementation"] = "flash_attention_2"
-                        torch.backends.cuda.matmul.allow_tf32 = True       # A100/H100 TF32 paths
-                        torch.set_float32_matmul_precision("high")         # PyTorch ≥2.0
-                        rope_scaling="dynamic"                     # avoids re‑alloc in long prompts
-
-                    elif cfg.model_type in {
+                    if flash_installed and cfg.model_type in {
                         "llama", "llama2", "llama3", "llama4",
-                        "mistral", "mixtral",
+                        "mistral", "mixtral", "mistral3",
                         "granite", "dbrx",
                         "falcon", "gemma",
                         "phi", "phi2", "phi3",
@@ -286,12 +632,14 @@ class ClinIQLinkSampleDatasetSubmit:
                         "stablelm", "starcoder2"
                     }:
                         extra_model_kwargs["attn_implementation"] = "flash_attention_2"
-                        # enable TF32 matmuls on A100/H100
                         torch.backends.cuda.matmul.allow_tf32 = True
-                        # PyTorch≥2.0 high-precision TF32
                         torch.set_float32_matmul_precision("high")
-
                         
+                    if "attn_implementation" in extra_model_kwargs:
+                        print("[INFO] Using FlashAttention2 for model acceleration.", flush=True)
+                    else:
+                        print("[INFO] FlashAttention2 not available – using default attention mechanism.", flush=True)
+
                     try:
                         model = ModelClass.from_pretrained(
                             entry_path,
@@ -328,50 +676,69 @@ class ClinIQLinkSampleDatasetSubmit:
                                     "Add an appropriate head mapping in load_participant_model().")
                             raise RuntimeError(f"Failed to load model at {entry_path}: {e}") from e
                     
-                    try:
-                        self.tokenizer = AutoTokenizer.from_pretrained(
-                            entry_path,
-                            trust_remote_code=True,
-                            padding_side="left",
-                            use_fast=True,
-                        )
-                    except Exception as e:
-                        print(f"[WARN] fast tokenizer failed: {e} – retrying with use_fast=False", flush=True)
-                        self.tokenizer = AutoTokenizer.from_pretrained(
-                            entry_path,
-                            trust_remote_code=True,
-                            padding_side="left",
-                            use_fast=False,
-                        )
+                    # try:
+                    #     self.tokenizer = AutoTokenizer.from_pretrained(
+                    #         entry_path,
+                    #         trust_remote_code=True,
+                    #         padding_side="left",
+                    #         use_fast=True,
+                    #     )
+                    # except Exception as e:
+                    #     print(f"[WARN] fast tokenizer failed: {e} – retrying with use_fast=False", flush=True)
+                    #     self.tokenizer = AutoTokenizer.from_pretrained(
+                    #         entry_path,
+                    #         trust_remote_code=True,
+                    #         padding_side="left",
+                    #         use_fast=False,
+                    #     )
 
+                    is_enc_dec = getattr(cfg, "is_encoder_decoder", False)
+                    padding_side = "right" if is_enc_dec else "left"
+
+                    self.load_participant_tokenizer(padding_side)
+                    if self.tokenizer is None:
+                        raise RuntimeError("Tokenizer failed to load. Cannot continue.")
+                    
+                    # make sure pad_token is defined
+                    self.tokenizer.pad_token = self.tokenizer.eos_token or self.tokenizer.unk_token
+                    self.tokenizer.pad_token_id = self.tokenizer.convert_tokens_to_ids(self.tokenizer.pad_token)
                     self._ensure_pad_token(self.tokenizer)
                     model.config.pad_token_id = self.tokenizer.pad_token_id
                     if hasattr(model, "generation_config"):
                         model.generation_config.pad_token_id = self.tokenizer.pad_token_id
+                    
                     print("Participant's Hugging Face model loaded successfully.", flush=True)
                     print(f"Loaded {cfg.model_type} as {ModelClass.__name__} + task='{self._pipeline_task}'", flush=True)
 
-                    # optional chat_template for LLaMA-like chat models
-                    if getattr(self.tokenizer, "chat_template", None) is None and "llama" in cfg.model_type:
-                        print("Setting manual chat template for LLaMA tokenizer...", flush=True)
-                        self.tokenizer.chat_template = (
-                            "{% for message in messages %}"
-                            "{% if message['role']=='system' %}"
-                            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
-                            "{{ message['content'] }}<|eot_id|>"
-                            "{% elif message['role']=='user' %}"
-                            "<|start_header_id|>user<|end_header_id|>\n"
-                            "{{ message['content'] }}<|eot_id|>"
-                            "{% elif message['role']=='assistant' %}"
-                            "<|start_header_id|>assistant<|end_header_id|>\n"
-                            "{{ message['content'] }}<|eot_id|>"
-                            "{% endif %}{% endfor %}"
-                            "<|start_header_id|>assistant<|end_header_id|>\n"
-                        )
+                    # # optional chat_template for LLaMA-like chat models
+                    # if getattr(self.tokenizer, "chat_template", None) is None and "llama" in cfg.model_type:
+                    #     print("Setting manual chat template for LLaMA tokenizer...", flush=True)
+                    #     self.tokenizer.chat_template = (
+                    #         "{% for message in messages %}"
+                    #         "{% if message['role']=='system' %}"
+                    #         "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
+                    #         "{{ message['content'] }}<|eot_id|>"
+                    #         "{% elif message['role']=='user' %}"
+                    #         "<|start_header_id|>user<|end_header_id|>\n"
+                    #         "{{ message['content'] }}<|eot_id|>"
+                    #         "{% elif message['role']=='assistant' %}"
+                    #         "<|start_header_id|>assistant<|end_header_id|>\n"
+                    #         "{{ message['content'] }}<|eot_id|>"
+                    #         "{% endif %}{% endfor %}"
+                    #         "<|start_header_id|>assistant<|end_header_id|>\n"
+                    #     )
+
+                    if getattr(self.tokenizer, "chat_template", None) is None:
+                        self.model_type = self.infer_model_type_from_config(cfg)
+                        print(f"[INFO] Inferred Model Type: {self.model_type}", flush=True)
+                        print("Setting manual chat template for tokenizer...", flush=True)
+                        self.tokenizer.chat_template = self.get_chat_template_string(self.model_type)
+                        print("Setting EOS_ID for tokenizer...", flush=True)
+                        self.set_eos_id(self.model_type)
+
 
                     for module, device in model.hf_device_map.items():
                         print(f"Module '{module or 'root'}' loaded on device: {device}")
-
 
                     num_gpus = torch.cuda.device_count()
                     for i in range(num_gpus):
@@ -712,8 +1079,7 @@ class ClinIQLinkSampleDatasetSubmit:
             return "Error generating prompt."
 
 
-
-
+    
     def participant_model(self, prompt, qa_type=None):
         """
         Uses the participant's loaded model to generate a response based on the given prompt.
@@ -727,38 +1093,129 @@ class ClinIQLinkSampleDatasetSubmit:
             # Handle Hugging Face chat models
             if isinstance(self.pipeline, TextGenerationPipeline):
                 if isinstance(prompt, list):
-                    conversations = [
-                        [{"role": "system", "content": self.SYSTEM_MSG},
-                        {"role": "user", "content": p}]
+                    batch_convs = [
+                        [
+                            {"role": "system", "content": self.SYSTEM_MSG},
+                            {"role": "user",   "content": p}
+                        ]
                         for p in prompt
                     ]
-                    inputs = self.tokenizer.apply_chat_template(
-                        conversations,
-                        add_generation_prompt=True,
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=self.max_length,
-                    ).to(self.model.device)
                 else:
-                    conversations = [
+                    batch_convs = [[
                         {"role": "system", "content": self.SYSTEM_MSG},
-                        {"role": "user", "content": prompt}
-                    ]
-                    inputs = self.tokenizer.apply_chat_template(
-                        conversations,
-                        add_generation_prompt=True,
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=self.max_length,
-                    ).to(self.model.device)
+                        {"role": "user",   "content": prompt}
+                    ]]
+                    
+                # Process prompts (single or batch)
+                all_input_ids = []
+                all_attention_masks = []
+                
+                for i, conv in enumerate(batch_convs):
+                    # print(f"[DEBUG] Processing conversation {i+1}/{len(batch_convs)}", flush=True)
+                    
+                    try:
+                        # Apply chat template 
+                        result = self.tokenizer.apply_chat_template(
+                            conv,
+                            add_generation_prompt=True,
+                            return_tensors="pt",
+                            truncation=True,
+                            max_length=self.max_length,
+                        )
+                        
+                        # Handle both dictionary and direct tensor return types
+                        if isinstance(result, dict) and "input_ids" in result:
+                            input_ids = result["input_ids"]
+                            attention_mask = result.get("attention_mask", torch.ones_like(input_ids))
+                        elif isinstance(result, torch.Tensor):
+                            input_ids = result
+                            attention_mask = torch.ones_like(input_ids)
+                        else:
+                            raise ValueError(f"Unexpected result type: {type(result)}")
+                            
+                        # Ensure proper shape
+                        if len(input_ids.shape) == 1:
+                            input_ids = input_ids.unsqueeze(0)
+                            attention_mask = attention_mask.unsqueeze(0)
+                            
+                        all_input_ids.append(input_ids)
+                        all_attention_masks.append(attention_mask)
+                            
+                    except Exception as e:
+                        print(f"[ERROR] Failed chat template: {e}. Using fallback.", flush=True)
+                        # Fallback to basic encoding
+                        fallback_input = self.tokenizer.encode(
+                            str(conv),  # Convert conversation to string
+                            return_tensors="pt",
+                            truncation=True,
+                            max_length=self.max_length,
+                        )
+                        all_input_ids.append(fallback_input)
+                        all_attention_masks.append(torch.ones_like(fallback_input))
+                
+                # Process collected tensors
 
-                # unpack both tensors
-                input_ids = inputs["input_ids"]
-                attention_mask = inputs["attention_mask"]
+                # # Find maximum sequence length for padding
+                # max_len = max(ids.shape[1] for ids in all_input_ids)
+                
+                # # Pad sequences as needed
+                # padded_ids = []
+                # padded_masks = []
+                
+                # pad_token_id = getattr(self.tokenizer, 'pad_token_id', 0)
+                
+                # for ids, mask in zip(all_input_ids, all_attention_masks):
+                #     pad_len = max_len - ids.shape[1]
+                #     if pad_len > 0:
+                #         # Add padding
+                #         padded_id = torch.nn.functional.pad(ids, (0, pad_len), value=pad_token_id)
+                #         padded_mask = torch.nn.functional.pad(mask, (0, pad_len), value=0)
+                #     else:
+                #         padded_id = ids
+                #         padded_mask = mask
+                    
+                #     padded_ids.append(padded_id)
+                #     padded_masks.append(padded_mask)
+                
+                # # Combine all tensors and move to device
+                # input_ids = torch.cat(padded_ids, dim=0).to(self.model.device)
+                # attention_mask = torch.cat(padded_masks, dim=0).to(self.model.device)
+                
+                # # re‐encode the batch of conversations (as strings) with left‐padding
+                
+                # texts = [
+                #     self.tokenizer.decode(ids.squeeze(), skip_special_tokens=True)
+                #     for ids in all_input_ids
+                # ]
 
-                eot_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
+                # batch = self.tokenizer(
+                #         texts,
+                #         return_tensors="pt",
+                #         padding=True,
+                #         truncation=True,
+                #         # max_length=self.max_length,
+                #     )
+
+                # input_ids      = batch["input_ids"].to(self.model.device)
+                # attention_mask = batch["attention_mask"].to(self.model.device)
+
+                # assume all_input_ids and all_attention_masks are Python lists of lists or tensors
+                # convert each tensor to a plain Python list of ints
+                batch_encoding = {
+                    "input_ids":      [ids.squeeze(0).tolist() for ids in all_input_ids],
+                    "attention_mask": [mask.squeeze(0).tolist() for mask in all_attention_masks],
+                }
+
+                # this pads on the longest sequence, using tokenizer.pad_token_id/padding_side
+                batch = self.tokenizer.pad(
+                    batch_encoding,
+                    padding=True,
+                    return_tensors="pt",
+                )
+
+                input_ids      = batch["input_ids"].to(self.model.device)
+                attention_mask = batch["attention_mask"].to(self.model.device)
+
                 gen_cfg = GenerationConfig(
                         max_new_tokens = {
                             "multiple_choice": 1024,
@@ -774,24 +1231,26 @@ class ClinIQLinkSampleDatasetSubmit:
                         top_p          = self.top_p,
                         top_k          = self.top_k,
                         top_n_tokens   = None,        # keep defaults
-                        eos_token_id   = eot_id,
+                        eos_token_id   = self.eos_id,
                         pad_token_id   = self.tokenizer.eos_token_id,
                     )
 
-                attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
+                # Recalculate attention mask as needed
+                if not isinstance(attention_mask, torch.Tensor):
+                    attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
+
                 output_ids = self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     generation_config=gen_cfg,
-                    #max_length=self.max_length,
+                    #max_new_tokens=self.max_length,
                     max_new_tokens=gen_cfg.max_new_tokens,  #added as mistral / mixtral was extremely slow 
                     pad_token_id=self.tokenizer.pad_token_id
                 )
 
                 response = self.tokenizer.batch_decode(
-                    output_ids[:, inputs.shape[-1]:], skip_special_tokens=True
+                    output_ids[:, input_ids.shape[1]:], skip_special_tokens=True
                 )
-
                 response = response if isinstance(prompt, list) else response[0]
 
             # Handle PyTorch models directly
@@ -818,11 +1277,17 @@ class ClinIQLinkSampleDatasetSubmit:
                     output_ids = self.model.generate(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        # max_length=self.max_length,
+                        # max_new_tokens=self.max_length,
                         max_new_tokens=gen_cfg.max_new_tokens,  #added as mistral / mixtral was extremely slow 
                         pad_token_id=self.tokenizer.pad_token_id
                     )
-                response = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+                
+                # print(f"[DEBUG] input_ids shape: {input_ids.shape}", flush=True)
+                # print(f"[DEBUG] output_ids shape: {output_ids.shape}", flush=True)
+                
+                response = self.tokenizer.batch_decode(
+                    output_ids[:, input_ids.shape[1]:], skip_special_tokens=True
+                )
                 response = response if isinstance(prompt, list) else response[0]
 
             # Script-based model
