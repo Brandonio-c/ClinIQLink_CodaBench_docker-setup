@@ -3,9 +3,11 @@ import os
 import random
 import argparse
 import torch
+import time
 import torch.distributed as dist
 from contextlib import suppress
-from transformers.pipelines import TextGenerationPipeline
+import re
+import transformers
 from transformers import (
     AutoConfig,
     AutoTokenizer,
@@ -17,27 +19,41 @@ from transformers import (
     pipeline,
     GenerationConfig,
 )
-import re
+from transformers.pipelines import TextGenerationPipeline
+
+print("Transformers version:", transformers.__version__)
+
 try:
     import flash_attn
     flash_installed = True
 except ImportError:
     flash_installed = False
+try:
+    import deepspeed
+    import mii
+except ImportError:
+    deepspeed = None
+    mii = None
+
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+
 
 # Explicitly set HuggingFace & Torch cache paths for consistency and safety inside container
-os.environ["HF_HOME"] = "/app/.cache/huggingface"
-os.environ["TRANSFORMERS_CACHE"] = "/app/.cache/transformers"
-os.environ["TORCH_HOME"] = "/app/.cache/torch"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
+# os.environ["HF_HOME"] = "/app/.cache/huggingface"
+# os.environ["TRANSFORMERS_CACHE"] = "/app/.cache/transformers"
+# os.environ["TORCH_HOME"] = "/app/.cache/torch"
+# os.environ["TRANSFORMERS_OFFLINE"] = "0"
 
-def is_main_process() -> bool:
-    return (not dist.is_available()
-            or not dist.is_initialized()
+def _is_main():
+    """True on rank-0 or in non-distributed mode."""
+    return (not dist.is_available() or not dist.is_initialized() 
             or dist.get_rank() == 0)
 
 class ClinIQLinkSampleDatasetSubmit:
     def __init__(self, run_mode="container", max_length=1028, sample_sizes=None, random_sample=False, chunk_size=2,
-                    do_sample=False, temperature=None, top_p=None, top_k=None, distributed=False):
+                    do_sample=False, temperature=None, top_p=None, top_k=None, distributed=False, model_root=None,
+                    data_dir=None, output_dir=None, allow_remote = False, ds_config=None, use_mii=False, tensor_parallel=2,
+                    hostfile=None, replica_num=2):
         self.run_mode = run_mode.lower()
         self.max_length = max_length
         self.sample_sizes = sample_sizes or {}
@@ -50,6 +66,22 @@ class ClinIQLinkSampleDatasetSubmit:
         self.distributed = distributed
         self.eos_id = None
         self.model_type = None
+        if ds_config is not None:
+            self.ds_config = json.load(open(ds_config, "r"))
+        self.ds_config_file = ds_config
+        self.use_mii = use_mii
+        self.tensor_parallel = tensor_parallel
+        self.hostfile = hostfile
+        print(f"Hostfile location: {hostfile}")
+
+        # Print the contents of the hostfile
+        if os.path.exists(hostfile):
+            with open(hostfile, 'r') as hostfile:
+                print("Hostfile contents:")
+                print(hostfile.read())
+        else:
+            print(f"Hostfile not found at {hostfile}")
+        self.replica_num = replica_num
         self._pipeline_task = ""
         if self.do_sample and (self.temperature is None or self.temperature <= 0):
             print("[WARN] --do_sample was set but temperature <=0; "
@@ -64,12 +96,29 @@ class ClinIQLinkSampleDatasetSubmit:
             print("Running in local mode.", flush=True)
             self.base_dir = os.path.dirname(os.path.abspath(__file__))
 
+        # if self.distributed and dist.is_initialized():
+        #     self.world_size    = dist.get_world_size()        # 4 GPUs here
+        #     # if the user did not pass --replica_num, infer it
+        #     self.replica_num   = replica_num or self.world_size // self.tensor_parallel
+        # else:
+        #     self.world_size  = 1
+        #     self.replica_num = 1
+
+        # if self.use_mii:
+        #     self.mii_deployment_name = f"{self.model_type}_tp{self.tensor_parallel}_r{self.replica_num}"
+            # print(f"[INFO] [MII] Deployment name = {self.mii_deployment_name}")
+
         # Dataset and template directory setup
-        self.dataset_dir = os.getenv("DATA_DIR", os.path.join(self.base_dir, "../data"))
+        self.model_root = model_root
+        self.dataset_dir = data_dir if data_dir is not None else \
+            os.getenv("DATA_DIR", os.path.join(self.base_dir, "../data"))
+        self.output_dir = output_dir
+
+        self.allow_remote = allow_remote
+
         self.template_dir = os.path.join(self.base_dir, "submission_template")
 
         self.model = self.load_participant_model()
-
         self.pipeline = self.load_participant_pipeline()
 
         # Load and sample the dataset
@@ -80,6 +129,7 @@ class ClinIQLinkSampleDatasetSubmit:
             "Do not repeat the question or add explanations."
         )
         self.CAP_LETTERS_RE = re.compile(r"\b[A-Z]\b")
+
 
     def _strip_noise(self, text: str) -> str:
         """Remove leading blank lines and stray 'assistant' artefacts."""
@@ -167,6 +217,8 @@ class ClinIQLinkSampleDatasetSubmit:
             return "mpt"
         elif "bloom" in model_type:
             return "bloom"
+        elif "deepseek" in model_type:
+            return "deepseek"
         elif "chatglm" in model_type:
             return "chatglm"
         elif "claude" in model_type or "anthropic" in model_type:
@@ -192,12 +244,17 @@ class ClinIQLinkSampleDatasetSubmit:
             "qwen":    "<|endoftext|>",
             "gpt":     "",            # GPT‑2 uses default eos_token
             "phi":     "</s>",
+            "mpt":     "</s>",
+            "deepseek":   "</s>",
+            "bloom":      "",
             "claude":  "",            # default eos_token
             # extend as you add new model families…
         }
 
         # 2) Pick your token string (fall back to tokenizer.eos_token)
-        token_str = eos_map.get(model_type.lower(), None) or self.tokenizer.eos_token
+        token_str = eos_map.get(model_type, None)
+        # if the map gives None, use whatever the tokenizer already has
+        token_str = token_str or self.tokenizer.eos_token
         if token_str is None:
             raise ValueError(f"No EOS token known for model_type={model_type}")
 
@@ -301,6 +358,14 @@ class ClinIQLinkSampleDatasetSubmit:
                 "Assistant: "
             )
 
+        elif "deepseek" in model_id:
+            return (
+                "{% for message in messages %}"
+                "[{{ message['role'].upper() }}]: {{ message['content'] }}\n"
+                "{% endfor %}"
+                "[ASSISTANT]: "
+            )
+        
         # === Falcon-style fallback ===
         elif "falcon" in model_id or "deepseek" in model_id or "phi" in model_id:
             return (
@@ -308,6 +373,28 @@ class ClinIQLinkSampleDatasetSubmit:
                 "[{{ message['role'].upper() }}]: {{ message['content'] }}\n"
                 "{% endfor %}"
                 "[ASSISTANT]: "
+            )
+        
+        elif "bloom" in model_id:
+            return (
+                "{% for message in messages %}"
+                "{{ message['role'].capitalize() }}: {{ message['content'] }}\n"
+                "{% endfor %}"
+                "Assistant: "
+            )
+        
+        elif "mpt" in model_id:
+            return (
+                "{% for message in messages %}"
+                "{% if message['role'] == 'system' %}"
+                "<|system|>\n{{ message['content'] }}\n"
+                "{% elif message['role'] == 'user' %}"
+                "<|user|>\n{{ message['content'] }}\n"
+                "{% elif message['role'] == 'assistant' %}"
+                "<|assistant|>\n{{ message['content'] }}\n"
+                "{% endif %}"
+                "{% endfor %}"
+                "<|assistant|>\n"
             )
 
         # === Default fallback ===
@@ -392,6 +479,40 @@ class ClinIQLinkSampleDatasetSubmit:
                 template += "[ASSISTANT]: "
             return tokenizer(template.strip(), return_tensors="pt", truncation=True, max_length=max_length)["input_ids"]
 
+        # === DeepSeek v3 ===
+        elif "deepseek" in model_id:
+            # DeepSeek uses the same bracketed-role format
+            template = ""
+            for m in messages:
+                role = m["role"].upper()
+                content = m["content"].strip()
+                template += f"[{role}]: {content}\n"
+            if add_generation_prompt:
+                template += "[ASSISTANT]: "
+            return tokenizer(
+                template.strip(),
+                return_tensors="pt",
+                truncation=True,
+                max_length=max_length
+            )["input_ids"]
+
+        # === Bloom-style ===
+        elif "bloom" in model_id:
+            # Bloom uses a simple Role: Content format
+            template = ""
+            for m in messages:
+                role = m["role"].capitalize()
+                content = m["content"].strip()
+                template += f"{role}: {content}\n"
+            if add_generation_prompt:
+                template += "Assistant: "
+            return tokenizer(
+                template.strip(),
+                return_tensors="pt",
+                truncation=True,
+                max_length=max_length
+            )["input_ids"]
+        
         # === Vicuna ===
         elif "vicuna" in model_id:
             template = ""
@@ -433,26 +554,32 @@ class ClinIQLinkSampleDatasetSubmit:
     
     def load_participant_tokenizer(self, padding_side):
         """Load tokenizer from a directory with fallback for non-fast versions."""
-        if self.run_mode == "local":
-            model_submissions_dir = os.path.join(self.base_dir, "../model_submission")
+        # pick root dir
+        if self.model_root:
+            root = self.model_root
+        elif self.run_mode == "local":
+            root = os.path.join(self.base_dir, "../model_submission")
         else:
-            model_dir_env = os.getenv("USE_INTERNAL_MODEL", "1").strip().lower()
-            if model_dir_env in ["1", "true", "yes"]:
-                model_submissions_dir = os.path.join(self.base_dir, "model_submission/snapshots")
-            else:
-                model_submissions_dir = os.path.join(self.base_dir, "model_submission/snapshots")
-        
-        if not os.path.exists(model_submissions_dir):
-            raise FileNotFoundError(f"[Tokenizer] No 'model_submissions' folder at {model_submissions_dir}")
+            root = os.path.join(self.base_dir, "model_submission/snapshots")
 
+        if not os.path.isdir(root):
+            raise FileNotFoundError(f"[Tokenizer] No directory at {root}")
 
-        for entry in os.listdir(model_submissions_dir):
-            entry_path = os.path.join(model_submissions_dir, entry)
-            if os.path.isdir(entry_path) and "config.json" in os.listdir(entry_path):
+        # build list of candidate model dirs
+        if "config.json" in os.listdir(root):
+            candidates = [root]
+        else:
+            candidates = [
+                os.path.join(root, d)
+                for d in os.listdir(root)
+                if os.path.isdir(os.path.join(root, d)) and "config.json" in os.listdir(os.path.join(root, d))
+            ]
+
+        for entry_path in candidates:
                 try:
                     self.tokenizer = AutoTokenizer.from_pretrained(
                         entry_path,
-                        trust_remote_code=True,
+                        trust_remote_code=self.allow_remote,
                         padding_side=padding_side,
                         use_fast=True,
                     )
@@ -463,7 +590,7 @@ class ClinIQLinkSampleDatasetSubmit:
                     print(f"[WARN] fast tokenizer failed: {e} – retrying with use_fast=False", flush=True)
                     self.tokenizer = AutoTokenizer.from_pretrained(
                         entry_path,
-                        trust_remote_code=True,
+                        trust_remote_code=self.allow_remote,
                         padding_side=padding_side,
                         use_fast=False,
                     )
@@ -475,7 +602,350 @@ class ClinIQLinkSampleDatasetSubmit:
                     print(f"[Tokenizer] Failed loading tokenizer from {entry_path}: {e2}", flush=True)
 
         raise RuntimeError("[Tokenizer] No valid tokenizer found in model_submissions.")
+
+    def _load_model_config_for_distributed(self, entry_path):
+        """
+        Load the appropriate model configuration based on the model type.
+        Handles LLaMA (v1–3), LLaMA-4, DeepSeek-V3, Falcon-180B, Bloom, Qwen-Large.
+        """
+        # 1) load the generic config first
+        base_cfg = AutoConfig.from_pretrained(
+            entry_path,
+            trust_remote_code=True,
+            local_files_only=False,
+        )
+        mtype = base_cfg.model_type.lower()
+
+        # 2) dispatch to specialized Config subclasses
+        LLAMA_FAMILY     = {"llama", "llama2", "llama3", "llama4"}
+        DEEPSEEK_FAMILY  = {"deepseek-v3", "deepseek_v3"}
+        BLOOM_FAMILY     = {"bloom"}
+        QWEN_FAMILY      = {"qwen", "qwen-large"}
+        FALCON_FAMILY    = {"falcon", "falcon-180b"}
+
+        if mtype in LLAMA_FAMILY:
+            # LLaMA-4 needs its own alias, older llama versions use the vanilla LlamaConfig
+            if mtype in ("llama4", "llama4_text"):
+                from transformers.models.llama.configuration_llama import LlamaConfig as Llama4TextConfig
+                print("[INFO] Loading LLaMA-4 config via AutoConfig + trust_remote_code…", flush=True)
+                cfg = AutoConfig.from_pretrained(
+                    entry_path,
+                    trust_remote_code=True,
+                    local_files_only=False,
+                )
+                # flatten out the nested text_config so nothing is missing
+                if hasattr(cfg, "text_config"):
+                    for attr, val in vars(cfg.text_config).items():
+                        setattr(cfg, attr, val)
+            else:
+                from transformers.models.llama.configuration_llama import LlamaConfig
+                print(f"[INFO] Loading LLaMA v1–3 config…", flush=True)
+                cfg = LlamaConfig.from_pretrained(
+                    entry_path, trust_remote_code=True, local_files_only=False
+                )
+
+        elif mtype in DEEPSEEK_FAMILY:
+            from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
+            print("[INFO] Loading DeepSeek-V3 config…", flush=True)
+            cfg = DeepseekV3Config.from_pretrained(
+                entry_path, trust_remote_code=True, local_files_only=False
+            )
+
+        elif mtype in BLOOM_FAMILY:
+            from transformers.models.bloom.configuration_bloom import BloomConfig
+            print("[INFO] Loading Bloom config…", flush=True)
+            cfg = BloomConfig.from_pretrained(
+                entry_path, trust_remote_code=True, local_files_only=False
+            )
+
+        elif mtype in QWEN_FAMILY:
+            from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+            print("[INFO] Loading Qwen-Large config…", flush=True)
+            cfg = Qwen3Config.from_pretrained(
+                entry_path, trust_remote_code=True, local_files_only=False
+            )
+
+        elif mtype in FALCON_FAMILY:
+            from transformers.models.falcon.configuration_falcon import FalconConfig
+            print("[INFO] Loading Falcon-180B config…", flush=True)
+            cfg = FalconConfig.from_pretrained(
+                entry_path, trust_remote_code=True, local_files_only=False
+            )
+
+        else:
+            # fallback to the base AutoConfig
+            print(f"[INFO] Falling back to generic config for model_type={mtype}", flush=True)
+            cfg = base_cfg
+
+        return cfg
+
+    def _ensure_config_for_distributed(self, cfg, model_dir):
+        """
+        Ensure that all necessary configuration attributes are present in `cfg`.
+        If not, inject them based on model-specific information (like tokenizer or default fallback values).
+        This version is designed to ensure all parameters required by DeepSpeed are provided.
+        """
+        # Ensure vocab_size is set
+        if not hasattr(cfg, "vocab_size"):
+            tok = AutoTokenizer.from_pretrained(
+                model_dir,
+                trust_remote_code=self.allow_remote,
+                local_files_only=(not self.allow_remote)
+            )
+            cfg.vocab_size = tok.vocab_size
+
+        # Ensure model parallelism and memory optimization attributes are set for DeepSpeed
+        if not hasattr(cfg, "attn_scale"):
+            cfg.attn_scale = 1.0  # Set a default value for 'attn_scale' if missing
+
+        # DeepSpeed requires certain memory and performance optimizations, set defaults where needed
+        if not hasattr(cfg, "dtype"):
+            cfg.dtype = "bfloat16"  # DeepSpeed usually uses 'bfloat16' for performance on modern GPUs
+
+        if not hasattr(cfg, "max_position_embeddings"):
+            cfg.max_position_embeddings = 8192  # Set a reasonable max_position_embeddings if missing
+        
+        if not hasattr(cfg, "floor_scale"):
+            cfg.floor_scale = 1.0  # Assign a default value
+
+
+        # Add missing model attributes based on configuration and model type
+        if hasattr(cfg, "model_type"):
+            if cfg.model_type == "llama4" or cfg.model_type == "llama4_text":
+                # Llama4 model specific attributes
+                if not hasattr(cfg, "hidden_size"):
+                    cfg.hidden_size = 5120  # Llama4 default hidden_size
+                
+                if not hasattr(cfg, "num_attention_heads"):
+                    cfg.num_attention_heads = 40  # Default number of attention heads
+                
+                if not hasattr(cfg, "num_hidden_layers"):
+                    cfg.num_hidden_layers = 48  # Llama4 default num_hidden_layers
+            
+            elif cfg.model_type == "bloom":
+                # Bloom model specific attributes
+                if not hasattr(cfg, "hidden_size"):
+                    cfg.hidden_size = 14336  # Bloom hidden size
+                if not hasattr(cfg, "num_attention_heads"):
+                    cfg.num_attention_heads = 112  # Bloom num_attention_heads
+                if not hasattr(cfg, "num_hidden_layers"):
+                    cfg.num_hidden_layers = 70  # Bloom num_hidden_layers
+                if not hasattr(cfg, "vocab_size"):
+                    cfg.vocab_size = 250880  # Bloom vocab_size
+            
+            elif cfg.model_type == "qwen3_moe":
+                # Qwen3 model specific attributes
+                if not hasattr(cfg, "hidden_size"):
+                    cfg.hidden_size = 4096  # Qwen3 hidden size
+                if not hasattr(cfg, "num_attention_heads"):
+                    cfg.num_attention_heads = 64  # Qwen3 num_attention_heads
+                if not hasattr(cfg, "num_hidden_layers"):
+                    cfg.num_hidden_layers = 94  # Qwen3 num_hidden_layers
+                if not hasattr(cfg, "vocab_size"):
+                    cfg.vocab_size = 151936  # Qwen3 vocab_size
+            
+            elif cfg.model_type == "deepseek_v3":
+                # DeepSeek V3 model specific attributes
+                if not hasattr(cfg, "hidden_size"):
+                    cfg.hidden_size = 7168  # DeepSeek V3 hidden size
+                if not hasattr(cfg, "num_attention_heads"):
+                    cfg.num_attention_heads = 128  # DeepSeek V3 num_attention_heads
+                if not hasattr(cfg, "num_hidden_layers"):
+                    cfg.num_hidden_layers = 61  # DeepSeek V3 num_hidden_layers
+                if not hasattr(cfg, "vocab_size"):
+                    cfg.vocab_size = 129280  # DeepSeek V3 vocab_size
+            
+            elif cfg.model_type == "falcon":
+                # Falcon model specific attributes
+                if not hasattr(cfg, "hidden_size"):
+                    cfg.hidden_size = 14848  # Falcon hidden size
+                if not hasattr(cfg, "num_attention_heads"):
+                    cfg.num_attention_heads = 232  # Falcon num_attention_heads
+                if not hasattr(cfg, "num_hidden_layers"):
+                    cfg.num_hidden_layers = 80  # Falcon num_hidden_layers
+                if not hasattr(cfg, "vocab_size"):
+                    cfg.vocab_size = 65024  # Falcon vocab_size
+
+        # DeepSpeed Engine-specific attributes:
+        # Ensure the configuration is fully compatible with DeepSpeed's distributed training/inference system
+        if not hasattr(cfg, "tensor_parallel"):
+            cfg.tensor_parallel = 1  # Set tensor parallelism if not defined, can adjust based on model size
+        if not hasattr(cfg, "zero_stage"):
+            cfg.zero_stage = 2  # Default to ZeRO stage 2 for memory efficiency in DeepSpeed
+        if not hasattr(cfg, "num_gpus"):
+            cfg.num_gpus = 1  # Set the number of GPUs being used by the model (DeepSpeed may require this)
+        if not hasattr(cfg, "local_rank"):
+            cfg.local_rank = 0  # DeepSpeed typically uses local_rank for multi-GPU setups
+
+        # Additional model and optimizer-specific configurations for DeepSpeed optimization
+        if not hasattr(cfg, "optimizer"):
+            cfg.optimizer = {
+                "type": "Adam",
+                "params": {
+                    "lr": 0.00015,
+                    "betas": [0.9, 0.999],
+                    "eps": 1e-8,
+                }
+            }
+
+        # Common fallback attributes that are used in multiple models
+        if not hasattr(cfg, "boi_token_index"):
+            cfg.boi_token_index = 200080
+        if not hasattr(cfg, "eoi_token_index"):
+            cfg.eoi_token_index = 200081
+        if not hasattr(cfg, "image_token_index"):
+            cfg.image_token_index = 200092
+        if not hasattr(cfg, "bos_token_id"):
+            cfg.bos_token_id = 200000
+        if not hasattr(cfg, "eos_token_id"):
+            cfg.eos_token_id = [200001, 200007, 200008]
+        if not hasattr(cfg, "num_experts_per_tok"):
+            cfg.num_experts_per_tok = 1
+        if not hasattr(cfg, "num_key_value_heads"):
+            cfg.num_key_value_heads = 8
+        if not hasattr(cfg, "pad_token_id"):
+            cfg.pad_token_id = 200018
+        if not hasattr(cfg, "initializer_range"):
+            cfg.initializer_range = 0.02
+        if not hasattr(cfg, "rope_theta"):
+            cfg.rope_theta = 500000.0
+        if not hasattr(cfg, "use_cache"):
+            cfg.use_cache = True
+        if not hasattr(cfg, "use_qk_norm"):
+            cfg.use_qk_norm = False
+
+        # Ensure DeepSpeed configurations are correctly set
+        if not hasattr(cfg, "tensor_parallel"):
+            cfg.tensor_parallel = 1  # Default tensor parallelism (DeepSpeed will use this for multi-GPU setup)
+        if not hasattr(cfg, "zero_stage"):
+            cfg.zero_stage = 2  # Default to ZeRO stage 2 for memory efficiency in DeepSpeed
+        if not hasattr(cfg, "num_gpus"):
+            cfg.num_gpus = torch.cuda.device_count()  # Automatically detect the number of GPUs
+        if not hasattr(cfg, "local_rank"):
+            cfg.local_rank = 0  # Default to local_rank 0 if it's not set
+
+        # Model-specific configuration (ensure weights are loaded properly)
+        if not hasattr(cfg, "optimizer"):
+            cfg.optimizer = {
+                "type": "Adam",
+                "params": {
+                    "lr": 0.00015,
+                    "betas": [0.9, 0.999],
+                    "eps": 1e-8,
+                }
+            }
+
+        # Optionally, log missing attributes
+        missing_params = [param for param in ["attn_scale", "hidden_size", "num_attention_heads", "num_hidden_layers"]
+                        if not hasattr(cfg, param)]
+        if missing_params:
+            print(f"Missing parameters set in config: {', '.join(missing_params)}")
+        
+        return cfg
     
+    def _init_deepspeed_config_and_model(self, entry_path, torch_dtype):
+        # reloading the config to ensure it will work with the init_empty_weights, we only need to do this
+        # for the big models we are distributing, so llama3/4, falcon 180B, deepseekv3, bloom
+        # assert dist.is_initialized(), "torch.distributed must be initialised first"
+        # rank = dist.get_rank() if (self.distributed and dist.is_initialized()) else 0
+
+        # world_size = dist.get_world_size()           # ranks over all nodes
+        # print(f"[INFO] World size is {world_size}", flush=True)
+
+        print("[INFO] reloading the config file to deal with empty weight initialisation bugs", flush=True)
+        cfg = self._load_model_config_for_distributed(entry_path)
+
+        # print("[INFO] Checking loaded config is valid ", flush=True)
+        # self._ensure_config_for_distributed(cfg, entry_path)
+
+        print("[INFO] Updated config file updated and checked! - Everything is fine. ", flush=True)
+
+        print("[INFO] Initialising the deepspeed model empty weights needed to start the model sharding", flush=True)
+
+        # index_file = os.path.join(entry_path, "model.safetensors.index.json")
+        # print(f"[INFO] Index file is at {index_file}", flush=True)
+
+        # with deepspeed.zero.Init():
+        #     model = AutoModelForCausalLM.from_pretrained(
+        #         entry_path,             # Use the entry_path to load the model from the directory
+        #         trust_remote_code=True  # Ensure remote code (e.g., custom configurations) is trusted
+        #     )
+
+        #with init_empty_weights():
+        # with deepspeed.zero.Init():
+        #     model = AutoModelForCausalLM.from_pretrained(
+        #         entry_path,  # Path to your model weights
+        #         trust_remote_code=True  # Ensure remote code is trusted if necessary
+        #     )
+
+        print("[INFO] DeepSpeed is now loading & slicing the HuggingFace checkpoint ...")
+            # Initialize DeepSpeed inference with model sharding
+
+        with init_empty_weights():
+            # with deepspeed.zero.Init():
+            engine = deepspeed.init_inference(
+                model=AutoModelForCausalLM.from_pretrained(entry_path, trust_remote_code=True ),
+                config=self.ds_config  # DeepSpeed configuration for inference
+            )
+        print("[INFO] Model is loaded and sharded successfully from Rank 0 to all GPU's.")
+        
+        # if rank == 0:
+        #     print("[INFO] DeepSpeed is now loading & slicing the HuggingFace checkpoint ...")
+        #     # Initialize DeepSpeed inference with model sharding
+
+        #     engine = deepspeed.init_inference(
+        #         model=AutoModelForCausalLM.from_pretrained(entry_path, trust_remote_code=True ),
+        #         config=self.ds_config  # DeepSpeed configuration for inference
+        #     )
+        
+        #     # Wait for all other ranks to sync
+        #     dist.barrier()
+        #     print("[INFO] Model is loaded and sharded successfully from Rank 0 to all GPU's.")
+
+        # else:
+        #     # Rank 1 and other ranks wait for Rank 0 to finish
+        #     print(f"[INFO] Rank {dist.get_rank()} waiting for model to be loaded by Rank 0...")
+
+        #     # Keep looping until Rank 0 has finished loading
+        #     while True:
+        #         # Check if Rank 0 has finished loading the model
+        #         if dist.get_rank() == 0:
+        #             break  # If rank 0 is done, exit the loop for rank 1
+                    
+        #         # Sleep for a short time before checking again
+        #         time.sleep(1)  # Adjust the sleep duration based on your needs
+
+        #     # Synchronize after Rank 0 has finished
+        #     dist.barrier()
+        #     print(f"[INFO] Rank {dist.get_rank()} continuing after model load.")
+            
+        return engine.module     # the wrapped, sharded model
+    
+
+    # def _init_mii(self, model_dir, tp_size, dtype_str, MII_DEPLOYMENT_NAME):
+    #     """
+    #     • Rank 0 launches the MII server (MoE-aware engine ‘ds-moe’)
+    #     • All other ranks wait, then create a lightweight client
+    #     """
+    #     rank = dist.get_rank() if (self.distributed and dist.is_initialized()) else 0
+
+    #     if rank == 0:
+    #         print("[MII] Launching MoE server…", flush=True)
+    #         mii.serve(
+    #             model_name_or_path=model_dir,
+    #             deployment_name=MII_DEPLOYMENT_NAME,
+    #             tensor_parallel=tp_size,
+    #             replica_num = self.replica_num, 
+    #             hostfile=self.hostfile,
+    #         )
+    #         if self.distributed:
+    #             dist.barrier()              # unblock the other ranks
+    #     else:
+    #         dist.barrier()
+
+    #     # everyone (rank 0 included) gets a client handle
+    #     print(f"[MII] Connecting rank {rank} to '{MII_DEPLOYMENT_NAME}'", flush=True)
+    #     self.mii_client = mii.client(MII_DEPLOYMENT_NAME)
     
     def load_participant_model(self):
         """
@@ -484,39 +954,64 @@ class ClinIQLinkSampleDatasetSubmit:
         """
         print("Searching for participant's LLM model in 'model_submissions'...", flush=True)
         
-        if self.run_mode == "local":
-            model_submissions_dir = os.path.join(self.base_dir, "../model_submission")
+        # Determine root directory
+        if self.model_root is not None:
+            model_submissions_dir = self.model_root
         else:
-            model_dir_env = os.getenv("USE_INTERNAL_MODEL", "1").strip().lower()
-            if model_dir_env in ["1", "true", "yes"]:
-                print(self.base_dir)
-                print(os.path.join(self.base_dir, "model_submission"))
-                model_submissions_dir = os.path.join(self.base_dir, "model_submission/snapshots")
+            if self.run_mode == "local":
+                model_submissions_dir = os.path.join(self.base_dir, "../model_submission")
             else:
+                model_dir_env = os.getenv("USE_INTERNAL_MODEL", "1").strip().lower()
                 model_submissions_dir = os.path.join(self.base_dir, "model_submission/snapshots")
-        
-        if not os.path.exists(model_submissions_dir):
+
+        # Existence check
+        if not os.path.isdir(model_submissions_dir):
             print(f"Error: 'model_submissions' folder not found at {model_submissions_dir}", flush=True)
             return None
 
+        # Allow passing either a single-model folder or a directory of models
+        if "config.json" in os.listdir(model_submissions_dir):
+            candidates = [model_submissions_dir]
+        else:
+            candidates = [
+                os.path.join(model_submissions_dir, d)
+                for d in os.listdir(model_submissions_dir)
+                if os.path.isdir(os.path.join(model_submissions_dir, d))
+            ]
+        
         # Search for potential models in the 'model_submissions' folder
-        for entry in os.listdir(model_submissions_dir):
-            entry_path = os.path.join(model_submissions_dir, entry)
-
+        for entry_path in candidates:
             # Case 1: Hugging Face Pretrained Model Directory
             if os.path.isdir(entry_path) and "config.json" in os.listdir(entry_path):
                 print(f"Loading Hugging Face model from: {entry_path}", flush=True)
                 try:
                     # Dynamically select torch_dtype for compatibility
+                    # pin each rank to its LOCAL_RANK GPU when in distributed mode
+                    # if self.distributed and torch.cuda.is_available():
+                    #     local_rank = int(os.environ.get("LOCAL_RANK", 0))
+                    #     torch.cuda.set_device(local_rank)
+                    #     torch_dtype = torch.bfloat16
+                    #     device_map = {"": f"cuda:{local_rank}"}
+                    # elif torch.cuda.is_available():
+                    #     torch_dtype = torch.bfloat16
+                    #     device_map = "auto"
+                    # elif torch.backends.mps.is_available():
+                    #     torch_dtype = torch.float32  # bfloat16 not supported on MPS
+                    #     device_map = {"": torch.device("mps")}
+                    # else:
+                    #     torch_dtype = torch.float32
+                    #     device_map = "auto"
+
+                    # Always let HF auto‐shard the model across all available GPUs:
                     if torch.cuda.is_available():
                         torch_dtype = torch.bfloat16
                         device_map = "auto"
                     elif torch.backends.mps.is_available():
-                        torch_dtype = torch.float32  # bfloat16 not supported on MPS
+                        torch_dtype = torch.float32
                         device_map = {"": torch.device("mps")}
                     else:
                         torch_dtype = torch.float32
-                        device_map = "auto"  # fallback to CPU
+                        device_map = "cpu"
 
                     # ---------------------------------------------------------------------
                     # Pick the right HF head + tell the rest of the code which pipeline to
@@ -524,10 +1019,9 @@ class ClinIQLinkSampleDatasetSubmit:
                     # ---------------------------------------------------------------------
                     cfg = AutoConfig.from_pretrained(
                             entry_path,
-                            trust_remote_code=True,
-                            local_files_only=True
+                            trust_remote_code=self.allow_remote,
+                            local_files_only=(not self.allow_remote)
                         )
-
 
                     auto_map = getattr(cfg, "auto_map", {}) or {}      # present in many custom repos
 
@@ -561,6 +1055,19 @@ class ClinIQLinkSampleDatasetSubmit:
                         ModelClass       = AutoModelForCausalLM
                         self._pipeline_task = "text-generation"
 
+                    elif cfg.model_type == "mpt":
+                        ModelClass = AutoModelForCausalLM
+                        self._pipeline_task = "text-generation"
+
+                    elif cfg.model_type.lower() in {"deepseek-v3", "deepseek_v3"} or "deepseek-v3" in entry_path.lower():
+                        ModelClass       = AutoModelForCausalLM
+                        self._pipeline_task = "text-generation"
+
+                    elif cfg.model_type.startswith("bloom"):
+                        ModelClass       = AutoModelForCausalLM
+                        self._pipeline_task = "text-generation"
+                
+
                     # 1) Custom repositories that ship their own heads
                     #    (ClinicalMosaic, future Gemma‑Flash, etc.)
                     elif "AutoModelForSequenceClassification" in auto_map:
@@ -589,7 +1096,6 @@ class ClinIQLinkSampleDatasetSubmit:
                         ModelClass       = AutoModelForSequenceClassification
                         self._pipeline_task = "text-classification"
 
-
                     # 4) Large decoder‑only families that don’t set is_decoder=True
                     #    (Falcon‑3, Mistral‑24B, Mixtral, Qwen‑2, etc.)
                     else:
@@ -616,22 +1122,29 @@ class ClinIQLinkSampleDatasetSubmit:
 
                     # Final guard – if *anything* above forgot to set a task
                     if not self._pipeline_task:
+                        print("[WARN] No pipeline_task found - assinging self._pipeline_task = text-generation", flush=True)
                         self._pipeline_task = "text-generation"
                     
                     # === Load model, preferring safetensors but falling back to PyTorch .bin ===
 
-                    #added in as mistral / mixtral was slow 
+                    #added to include flash attention 
                     extra_model_kwargs = {}
-                    if flash_installed and cfg.model_type in {
-                        "llama", "llama2", "llama3", "llama4",
-                        "mistral", "mixtral", "mistral3",
-                        "granite", "dbrx",
-                        "falcon", "gemma",
-                        "phi", "phi2", "phi3",
-                        "qwen2", "qwen2moe",
-                        "stablelm", "starcoder2"
-                    }:
-                        extra_model_kwargs["attn_implementation"] = "flash_attention_2"
+                    if flash_installed and torch.cuda.is_available():
+                        cc = torch.cuda.get_device_capability()
+                        model_path_lower = entry_path.lower()
+                        if cc[0] >= 8 and cfg.model_type in {
+                            "llama", "llama2", "llama3", "llama4",
+                            "mistral", "mixtral", "mistral3",
+                            "granite", "dbrx",
+                            "falcon", "gemma",
+                            "phi", "phi2", "phi3",
+                            "qwen2", "qwen2moe",
+                            "stablelm", "starcoder2"
+                        }:
+                            # Skip FA2 for Pixtral-style models or anything with 'vision'
+                            if "pixtral" not in model_path_lower and "vision" not in cfg.model_type.lower():
+                                extra_model_kwargs["attn_implementation"] = "flash_attention_2"
+
                         torch.backends.cuda.matmul.allow_tf32 = True
                         torch.set_float32_matmul_precision("high")
                         
@@ -641,16 +1154,33 @@ class ClinIQLinkSampleDatasetSubmit:
                         print("[INFO] FlashAttention2 not available – using default attention mechanism.", flush=True)
 
                     try:
-                        model = ModelClass.from_pretrained(
-                            entry_path,
-                            trust_remote_code=True,
-                            use_safetensors=True,
-                            device_map=device_map,
-                            torch_dtype=torch_dtype,
-                            local_files_only=True,
-                            **extra_model_kwargs, 
-                        )
-                        print(f"[INFO] Loaded model from {entry_path} with safetensors.", flush=True)
+                        
+                        if self.distributed:
+                            if self.use_mii:
+                                # self.mii_deployment_name = f"{self.model_type}_tp{self.tensor_parallel}_r{self.replica_num}"
+                                # print(f"[INFO] [MII] Deployment name = {self.mii_deployment_name}")
+                                # print("[INFO] Using MII")
+                                # self._init_mii(
+                                #             model_dir = entry_path,          
+                                #             tp_size   = self.tensor_parallel,     
+                                #             dtype_str = torch_dtype,
+                                #             MII_DEPLOYMENT_NAME = self.mii_deployment_name
+                                #         )
+                                continue
+                            else:
+                                model = self._init_deepspeed_config_and_model(entry_path, torch_dtype)
+  
+                        else:
+                            model = ModelClass.from_pretrained(
+                                entry_path,
+                                trust_remote_code=self.allow_remote,
+                                use_safetensors=True,
+                                device_map=device_map,
+                                torch_dtype=torch_dtype,
+                                local_files_only= (not self.allow_remote),
+                                **extra_model_kwargs, 
+                            )
+                            print(f"[INFO] Loaded model from {entry_path} with safetensors.", flush=True)
 
                     except Exception as e:
                         err_str = str(e).lower()
@@ -659,38 +1189,36 @@ class ClinIQLinkSampleDatasetSubmit:
                         if "safetensors" in err_str:
                             print(f"[WARN] No safetensors weights at {entry_path}; retrying with use_safetensors=False", flush=True)
 
-                            # Retry with standard PyTorch weights
-                            model = ModelClass.from_pretrained(
-                                entry_path,
-                                trust_remote_code=True,
-                                use_safetensors=False,
-                                device_map=device_map,
-                                torch_dtype=torch_dtype,
-                                local_files_only=True
-                            )
+                            if self.distributed:
+                                if self.use_mii:
+                                    # print("[INFO] Using MII")
+                                    # self._init_mii(
+                                    #             model_dir = entry_path,          
+                                    #             tp_size   = self.tensor_parallel,     
+                                    #             dtype_str = torch_dtype,
+                                    #             MII_DEPLOYMENT_NAME = self.mii_deployment_name
+                                    #         )
+                                    continue
+                                else:
+                                    model = self._init_deepspeed_config_and_model(entry_path, torch_dtype)
+                            else:
+                                # Retry with standard PyTorch weights
+                                model = ModelClass.from_pretrained(
+                                    entry_path,
+                                    trust_remote_code=self.allow_remote,
+                                    use_safetensors=False,
+                                    device_map=device_map,
+                                    torch_dtype=torch_dtype,
+                                    local_files_only=(not self.allow_remote)
+                                )
+
                             print(f"[INFO] Loaded model from {entry_path} with PyTorch .bin weights.", flush=True)
 
                         else:
                             # Some other error: propagate with context
-                            print(f"Unrecognised / unsupported model type '{cfg.model_type}'. "
-                                    "Add an appropriate head mapping in load_participant_model().")
+                            # print(f"Unrecognised / unsupported model type '{cfg.model_type}'. "
+                            #         "Add an appropriate head mapping in load_participant_model().")
                             raise RuntimeError(f"Failed to load model at {entry_path}: {e}") from e
-                    
-                    # try:
-                    #     self.tokenizer = AutoTokenizer.from_pretrained(
-                    #         entry_path,
-                    #         trust_remote_code=True,
-                    #         padding_side="left",
-                    #         use_fast=True,
-                    #     )
-                    # except Exception as e:
-                    #     print(f"[WARN] fast tokenizer failed: {e} – retrying with use_fast=False", flush=True)
-                    #     self.tokenizer = AutoTokenizer.from_pretrained(
-                    #         entry_path,
-                    #         trust_remote_code=True,
-                    #         padding_side="left",
-                    #         use_fast=False,
-                    #     )
 
                     is_enc_dec = getattr(cfg, "is_encoder_decoder", False)
                     padding_side = "right" if is_enc_dec else "left"
@@ -710,24 +1238,6 @@ class ClinIQLinkSampleDatasetSubmit:
                     print("Participant's Hugging Face model loaded successfully.", flush=True)
                     print(f"Loaded {cfg.model_type} as {ModelClass.__name__} + task='{self._pipeline_task}'", flush=True)
 
-                    # # optional chat_template for LLaMA-like chat models
-                    # if getattr(self.tokenizer, "chat_template", None) is None and "llama" in cfg.model_type:
-                    #     print("Setting manual chat template for LLaMA tokenizer...", flush=True)
-                    #     self.tokenizer.chat_template = (
-                    #         "{% for message in messages %}"
-                    #         "{% if message['role']=='system' %}"
-                    #         "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
-                    #         "{{ message['content'] }}<|eot_id|>"
-                    #         "{% elif message['role']=='user' %}"
-                    #         "<|start_header_id|>user<|end_header_id|>\n"
-                    #         "{{ message['content'] }}<|eot_id|>"
-                    #         "{% elif message['role']=='assistant' %}"
-                    #         "<|start_header_id|>assistant<|end_header_id|>\n"
-                    #         "{{ message['content'] }}<|eot_id|>"
-                    #         "{% endif %}{% endfor %}"
-                    #         "<|start_header_id|>assistant<|end_header_id|>\n"
-                    #     )
-
                     if getattr(self.tokenizer, "chat_template", None) is None:
                         self.model_type = self.infer_model_type_from_config(cfg)
                         print(f"[INFO] Inferred Model Type: {self.model_type}", flush=True)
@@ -737,8 +1247,10 @@ class ClinIQLinkSampleDatasetSubmit:
                         self.set_eos_id(self.model_type)
 
 
-                    for module, device in model.hf_device_map.items():
-                        print(f"Module '{module or 'root'}' loaded on device: {device}")
+                    # only dump device-map if available
+                    if hasattr(model, "hf_device_map"):
+                        for module, device in model.hf_device_map.items():
+                            print(f"Module '{module or 'root'}' loaded on device: {device}")
 
                     num_gpus = torch.cuda.device_count()
                     for i in range(num_gpus):
@@ -753,11 +1265,14 @@ class ClinIQLinkSampleDatasetSubmit:
                     print(f"Failed to load Hugging Face model: {e}", flush=True)
 
             # Case 2: Model Checkpoint (PyTorch)
-            elif entry.endswith(".pt") or entry.endswith(".pth"):
+            elif os.path.isfile(entry_path) and entry_path.endswith((".pt", ".pth")):
                 print(f"Loading PyTorch model checkpoint: {entry_path}", flush=True)
                 try:
                     map_location = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                    model = torch.load(entry_path, map_location=map_location)
+                    if self.distributed:
+                        model = self._init_deepspeed_config_and_model(entry_path, torch_dtype)
+                    else:
+                        model = torch.load(entry_path, map_location=map_location)
                     print("Participant's PyTorch model loaded successfully.", flush=True)
                     # Set fallback tokenizer
                     if not hasattr(self, "tokenizer") or self.tokenizer is None:
@@ -776,13 +1291,16 @@ class ClinIQLinkSampleDatasetSubmit:
                     print(f"Failed to load PyTorch model checkpoint: {e}", flush=True)
 
             # Case 3: Python Model Script
-            elif entry.endswith(".py"):
+            elif os.path.isfile(entry_path) and entry_path.endswith(".py"):
                 print(f"Attempting to execute model script: {entry_path}", flush=True)
                 try:
-                    model_namespace = {}
-                    with open(entry_path, "r") as f:
-                        exec(f.read(), model_namespace)
-                    model = model_namespace.get("model", None)
+                    if self.distributed:
+                        model = self._init_deepspeed_config_and_model(entry_path, torch_dtype)
+                    else:
+                        model_namespace = {}
+                        with open(entry_path, "r") as f:
+                            exec(f.read(), model_namespace)
+                        model = model_namespace.get("model", None)
                     # Set fallback tokenizer if not already set
                     if not hasattr(self, "tokenizer") or self.tokenizer is None:
                         # Try loading tokenizer from a default path or adjacent tokenizer folder
@@ -817,21 +1335,34 @@ class ClinIQLinkSampleDatasetSubmit:
         """
         print("Searching for participant's LLM pipeline in 'model_submissions'...", flush=True)
 
-        if self.run_mode == "local":
+        # pick the directory we’re going to scan
+        if self.model_root:
+            model_submissions_dir = self.model_root
+        elif self.run_mode == "local":
             model_submissions_dir = os.path.join(self.base_dir, "../model_submission")
         else:
-            model_dir_env = os.getenv("USE_INTERNAL_MODEL", "1").strip().lower()
-            if model_dir_env in ["1", "true", "yes"]:
-                model_submissions_dir = os.path.join(self.base_dir, "model_submission/snapshots")
-            else:
-                model_submissions_dir = os.path.join(self.base_dir, "model_submission/snapshots")
-        
-        if not os.path.exists(model_submissions_dir):
-            print(f"Error: 'model_submissions' folder not found at {model_submissions_dir}", flush=True)
+            # unchanged for container
+            model_submissions_dir = os.path.join(self.base_dir, "model_submission/snapshots")
+
+        # sanity check
+        if not os.path.isdir(model_submissions_dir):
+            print(f"Error: model directory not found at {model_submissions_dir}", flush=True)
             return None
 
-        for entry in os.listdir(model_submissions_dir):
-            entry_path = os.path.join(model_submissions_dir, entry)
+        # build a list of candidate model folders
+        if "config.json" in os.listdir(model_submissions_dir):
+            # the user pointed directly at a model
+            candidates = [model_submissions_dir]
+        else:
+            # scan for sub‐folders under the default path
+            candidates = [
+                os.path.join(model_submissions_dir, d)
+                for d in os.listdir(model_submissions_dir)
+                if os.path.isdir(os.path.join(model_submissions_dir, d))
+            ]
+
+        # now load from each candidate
+        for entry_path in candidates:
 
             # Case 1: Hugging Face Transformer Model
             if os.path.isdir(entry_path) and "config.json" in os.listdir(entry_path):
@@ -843,6 +1374,10 @@ class ClinIQLinkSampleDatasetSubmit:
                     "tokenizer":  self.tokenizer,
                     "batch_size": self.chunk_size,
                 }
+
+                # pin the HF pipeline to the LOCAL_RANK GPU in distributed mode
+                # if self.distributed and torch.cuda.is_available():
+                #     pipeline_kwargs["device"] = int(os.environ.get("LOCAL_RANK", 0))
 
                 # generation pipelines get full control over sampling / length
                 if self._pipeline_task in ("text-generation", "text2text-generation"):
@@ -873,7 +1408,7 @@ class ClinIQLinkSampleDatasetSubmit:
 
 
             # Case 2: PyTorch Model Checkpoint
-            elif entry.endswith(".pt") or entry.endswith(".pth"):
+            elif os.path.isfile(entry_path) and entry_path.endswith((".pt", ".pth")):
                 print(f"Loading PyTorch model checkpoint: {entry_path}", flush=True)
                 try:
                     map_location = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -884,7 +1419,7 @@ class ClinIQLinkSampleDatasetSubmit:
                     print(f"Failed to load PyTorch model checkpoint: {e}", flush=True)
 
             # Case 3: Python Script-based Model
-            elif entry.endswith(".py"):
+            elif os.path.isfile(entry_path) and entry_path.endswith(".py"):
                 print(f"Attempting to execute model script: {entry_path}", flush=True)
                 try:
                     model_namespace = {}
@@ -1090,8 +1625,34 @@ class ClinIQLinkSampleDatasetSubmit:
             return "NO LLM IMPLEMENTED"
 
         try:
+            # ─────────────────────────────────────────────────────────────
+            # 1) For GPT-family (GPT-J, GPT-NeoX, GPT-2, etc.), use
+            #    the built-in pipeline which respects eos_token_id.
+            # ─────────────────────────────────────────────────────────────
+            if isinstance(self.pipeline, TextGenerationPipeline) and self.model_type in {"gpt", "gptj", "gpt_neox"}:
+                # pick a sensible token budget per QA type
+                max_new_tokens = {
+                            "multiple_choice": 1024,
+                            "list": 1024,
+                            "true_false": 1024,
+                            "short": 2048,
+                            "short_inverse": 2048,
+                            "multi_hop": 2048,
+                            "multi_hop_inverse": 2048,
+                        }.get(qa_type, 32)
+                return self.pipeline(
+                    prompt,
+                    max_new_tokens=max_new_tokens,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    do_sample=self.do_sample,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    top_k=self.top_k,
+                )
+
             # Handle Hugging Face chat models
-            if isinstance(self.pipeline, TextGenerationPipeline):
+            elif isinstance(self.pipeline, TextGenerationPipeline):
                 if isinstance(prompt, list):
                     batch_convs = [
                         [
@@ -1575,16 +2136,75 @@ class ClinIQLinkSampleDatasetSubmit:
         Ensures the output directory exists.
         """
         try:
-            output_dir = os.path.join(self.base_dir, "submission_output")
+            # if self.distributed and self.use_mii:
+            #     try:
+            #         output_dir = (self.output_dir or
+            #                     os.path.join(self.base_dir, "submission_output"))
+            #         # only rank-0 touches disk
+            #         if _is_main():
+            #             os.makedirs(output_dir, exist_ok=True)
+
+            #         qa_types = {
+            #             "true_false":        self.submit_true_false_questions,
+            #             "multiple_choice":   self.submit_multiple_choice_questions,
+            #             "list":              self.submit_list_questions,
+            #             "short":             self.submit_short_questions,
+            #             "short_inverse":     self.submit_short_inverse_questions,
+            #             "multi_hop":         self.submit_multi_hop_questions,
+            #             "multi_hop_inverse": self.submit_multi_hop_inverse_questions,
+            #         }
+
+            #         for qa_type, submit_fn in qa_types.items():
+            #             if _is_main():
+            #                 print(f"[RUN] {qa_type}", flush=True)
+
+            #             local_result = submit_fn()      # every rank runs inference
+
+            #             # ─── gather results if we are in distributed mode ───
+            #             if self.distributed and dist.is_initialized():
+            #                 gathered = [None] * dist.get_world_size()
+            #                 dist.all_gather_object(gathered, local_result)
+
+            #                 if _is_main():
+            #                     # flatten the list of dicts coming from all ranks
+            #                     merged = {
+            #                         "inputs":    sum((r["inputs"]    for r in gathered), []),
+            #                         "responses": sum((r["responses"] for r in gathered), [])
+            #                     }
+            #                     if any("prompts" in r for r in gathered):
+            #                         merged["prompts"] = \
+            #                             sum((r.get("prompts", []) for r in gathered), [])
+            #             else:
+            #                 merged = local_result
+
+            #             # ─── only rank-0 writes the JSON ───
+            #             if _is_main():
+            #                 fpath = os.path.join(output_dir, f"{qa_type}.json")
+            #                 with open(fpath, "w") as f:
+            #                     json.dump(merged, f, indent=4)
+            #                 print(f"[SAVE] {fpath}", flush=True)
+
+            #         if self.distributed and dist.is_initialized():
+            #             dist.barrier()        # sync before exiting
+
+            #         if _is_main():
+            #             print(f"[DONE] outputs → {output_dir}", flush=True)
+
+            #     except Exception as e:
+            #         print(f"[ERROR] run_all_submissions: {e}", flush=True)
+            
+            # else:
+
+            output_dir = self.output_dir or os.path.join(self.base_dir, "submission_output")
             os.makedirs(output_dir, exist_ok=True)
 
             qa_types = {
-                "true_false": self.submit_true_false_questions,
-                "multiple_choice": self.submit_multiple_choice_questions,
-                "list": self.submit_list_questions,
-                "short": self.submit_short_questions,
-                "multi_hop": self.submit_multi_hop_questions,
-                "short_inverse": self.submit_short_inverse_questions,
+                "true_false":        self.submit_true_false_questions,
+                "multiple_choice":   self.submit_multiple_choice_questions,
+                "list":              self.submit_list_questions,
+                "short":             self.submit_short_questions,
+                "multi_hop":         self.submit_multi_hop_questions,
+                "short_inverse":     self.submit_short_inverse_questions,
                 "multi_hop_inverse": self.submit_multi_hop_inverse_questions,
             }
 
@@ -1593,29 +2213,57 @@ class ClinIQLinkSampleDatasetSubmit:
                 result = submit_fn()
 
                 output_path = os.path.join(output_dir, f"{qa_type}.json")
-                if self.distributed:
-                    if is_main_process():
-                        with open(output_path, "w") as f:
-                            json.dump(result, f, indent=4)
-                        print(f"Saved {qa_type} results to {output_path}", flush=True)
+                with open(output_path, "w") as f:
+                    json.dump(result, f, indent=4)
+                print(f"Saved {qa_type} results to {output_path}", flush=True)
 
-                    if is_main_process():
-                        print(f"All inference outputs saved to separate JSON files in {output_dir}", flush=True)
+            # for qa_type, submit_fn in qa_types.items():
+            #     print(f"Running inference for: {qa_type}", flush=True)
+            #     local_result = submit_fn()
 
-                else:
-                    with open(output_path, "w") as f:
-                        json.dump(result, f, indent=4)
-                    print(f"Saved {qa_type} results to {output_path}", flush=True)
+            #     if self.distributed:
+            #         # gather all per-rank dicts into a list on every rank
+            #         world_size = dist.get_world_size()
+            #         gathered = [None] * world_size
+            #         dist.all_gather_object(gathered, local_result)
 
-            if self.distributed:
-                if dist.is_initialized():
-                        dist.barrier()
+            #         if is_main_process():
+            #             # merge them end-to-end
+            #             merged_inputs    = []
+            #             merged_responses = []
+            #             merged_prompts   = []
+            #             for r in gathered:
+            #                 merged_inputs   .extend(r["inputs"])
+            #                 merged_responses.extend(r["responses"])
+            #                 merged_prompts  .extend(r.get("prompts", []))
 
-            if self.distributed:
-                if is_main_process():
-                    print(f"[DONE] All outputs in {output_dir}", flush=True)
-            else:
-                print(f"All inference outputs saved to separate JSON files in {output_dir}", flush=True)
+            #             final = {
+            #                 "inputs":    merged_inputs,
+            #                 "responses": merged_responses,
+            #             }
+            #             if merged_prompts:
+            #                 final["prompts"] = merged_prompts
+
+            #             output_path = os.path.join(output_dir, f"{qa_type}.json")
+            #             with open(output_path, "w") as f:
+            #                 json.dump(final, f, indent=4)
+            #             print(f"Saved merged {qa_type} to {output_path}", flush=True)
+
+            #     else:
+            #         output_path = os.path.join(output_dir, f"{qa_type}.json")
+            #         with open(output_path, "w") as f:
+            #             json.dump(local_result, f, indent=4)
+            #         print(f"Saved {qa_type} results to {output_path}", flush=True)
+
+            # # synchronize and final message
+            # if self.distributed and dist.is_initialized():
+            #     dist.barrier()
+
+            # if self.distributed:
+            #     if is_main_process():
+            #         print(f"[DONE] All outputs in {output_dir}", flush=True)
+            # else:
+            #     print(f"All inference outputs saved to separate JSON files in {output_dir}", flush=True)
 
         except Exception as e:
             print(f"Error running all submissions: {e}", flush=True)
@@ -1669,27 +2317,68 @@ def parse_args():
         help="Enable torch.distributed (multi-GPU / multi-node via torchrun or SLURM) (launch with torchrun or srun –ntasks>1"
     )
 
+    parser.add_argument(
+        "--model_dir",
+        type=str,
+        default=None,
+        help="Path to the model_submissions directory (overrides default)"
+    )
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default=None,
+        help="Path to the QA data directory (overrides DATA_DIR env or ../data)"
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Path to write all inference JSON outputs (overrides submission_output)"
+    )
+
+    parser.add_argument(
+        "--allow_remote",
+        action="store_true",
+        default=False,
+        help="Whether to permit remote downloads (default: False → offline mode)",
+    )
+    parser.add_argument(
+        "--ds_config",
+        type=str,
+        default=None,
+        help="Path to DeepSpeed inference config file (JSON)"
+    )
+
+    parser.add_argument(
+        "--use_mii", 
+        action="store_true",
+        help="Serve the model with DeepSpeed-MII instead of HF/DS init_inference"
+    )
+    
+    parser.add_argument(
+        "--tensor_parallel", 
+        type=int, 
+        default=2,
+        help="Number of TP shards (MII only, default = 8)"
+        )
+
+    parser.add_argument(
+        "--hostfile",
+        type=str,
+        default=None,
+        help="hostfile path"
+    )
+
+    parser.add_argument(
+        "--replica_num",
+        type=int,
+        default=None,              # we will infer it if not given
+        help="How many DeepSpeed-MII replicas to start (defaults to #nodes)"
+    )
+
+
     
     return parser.parse_args()
-
-
-def init_distributed(local_rank: int):
-    """
-    Initialise torch.distributed if launched with --distributed.
-    """
-    if not dist.is_available():
-        raise RuntimeError("torch.distributed is not available.")
-    if dist.is_initialized():
-        print("[WARN] torch.distributed already initialized.", flush=True)
-        return
-    if "RANK" not in os.environ:
-        raise RuntimeError("Distributed mode requested but RANK env var not found. Are you using torchrun or SLURM with srun?")
-    
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
-    dist.init_process_group(backend=backend, init_method="env://")
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-    print(f"[Distributed] Initialized rank {dist.get_rank()}/{dist.get_world_size()} on device {torch.cuda.current_device()}", flush=True)
 
 
 if __name__ == "__main__":
@@ -1704,10 +2393,23 @@ if __name__ == "__main__":
         "num_multi_inv": args.num_multi_inv,
     }
 
+    if args.allow_remote:
+        os.environ.pop("TRANSFORMERS_OFFLINE", None)
+    else:
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
     if args.distributed:
-        init_distributed(args.local_rank)
-
+        if deepspeed is None:
+            raise RuntimeError("You passed --distributed but DeepSpeed is not installed")
+        # import torch.distributed as dist
+        # dist.init_process_group(
+        #     backend="nccl",
+        #     init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
+        #     world_size=int(os.environ["WORLD_SIZE"]),
+        #     rank=int(os.environ["RANK"]),
+        # )
+        # torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        # print(f"Rank: {os.environ['RANK']} out of {os.environ['WORLD_SIZE']} processes")
 
     submit = ClinIQLinkSampleDatasetSubmit(
         run_mode      = args.mode,
@@ -1720,5 +2422,15 @@ if __name__ == "__main__":
         top_p       = args.top_p,
         top_k       = args.top_k,
         distributed = args.distributed,
+        model_root  = args.model_dir,
+        data_dir    = args.data_dir,
+        output_dir  = args.output_dir,
+        allow_remote = args.allow_remote,
+        ds_config   = args.ds_config,
+        use_mii     = args.use_mii, 
+        tensor_parallel = args.tensor_parallel,
+        hostfile    = args.hostfile,
+        replica_num = args.replica_num
     )
+
     submit.run_all_submissions()

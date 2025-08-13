@@ -124,7 +124,10 @@ from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from nltk.translate.meteor_score import meteor_score
 from rouge_score import rouge_scorer
 from sklearn.feature_extraction.text import TfidfVectorizer
-
+from collections import Counter, OrderedDict
+from sklearn.metrics import precision_recall_fscore_support
+from sklearn.preprocessing import MultiLabelBinarizer
+import unicodedata
 
 # Explicitly set HuggingFace & Torch cache paths for consistency and safety inside container
 os.environ["HF_HOME"] = "/app/.cache/huggingface"
@@ -153,10 +156,11 @@ except LookupError:
     print("Downloading 'punkt' tokenizer...")
 
 class ClinIQLinkSampleDatasetEvaluate:
-    def __init__(self, run_mode="container", results_dir="submission_output", bin_width=0.05):
+    def __init__(self, run_mode="container", results_dir="submission_output", bin_width=0.05, output_dir="evaluation_output"):
         self.run_mode = run_mode.lower()
         self.results_dir = results_dir
         self.bin_width  = bin_width
+        self.output_dir = output_dir
         # Base directories and setup depending on run mode
         if run_mode == "container":
             print("Running in container mode.", flush=True)
@@ -273,6 +277,17 @@ class ClinIQLinkSampleDatasetEvaluate:
             return None
         
 
+    # def _load_outputs(self):
+    #     data = {}
+    #     for k, fname in self.QA_FILES.items():
+    #         fpath = os.path.join(self.results_dir, fname)
+    #         if not os.path.exists(fpath):
+    #             print(f"[WARN] {fpath} not found – skipping {k}", flush=True)
+    #             data[k] = None
+    #             continue
+    #         data[k] = self.load_json(fpath)
+    #     return data
+
     def _load_outputs(self):
         data = {}
         for k, fname in self.QA_FILES.items():
@@ -281,7 +296,17 @@ class ClinIQLinkSampleDatasetEvaluate:
                 print(f"[WARN] {fpath} not found – skipping {k}", flush=True)
                 data[k] = None
                 continue
-            data[k] = self.load_json(fpath)
+
+            # Load original JSON blob
+            blob = self.load_json(fpath)
+
+            if blob and "responses" in blob:
+                responses = blob["responses"]
+                cleaned_responses, reasoning_steps = self._extract_reasoning_steps(responses)
+                blob["responses"] = cleaned_responses
+                blob["reasoning_model_thinking_steps"] = reasoning_steps
+
+            data[k] = blob
         return data
     
     def _average(self, lst):
@@ -362,6 +387,319 @@ class ClinIQLinkSampleDatasetEvaluate:
         return " ".join(toks)
     
 
+    def _extract_reasoning_steps(self, responses):
+        """
+        Given a list of model responses, extract `<think>...</think>` blocks,
+        remove them from the main text, and return:
+        - cleaned responses
+        - list of extracted reasoning steps (as strings or list of strings)
+        """
+        cleaned_responses = []
+        reasoning_steps = []
+
+        for resp in responses:
+            text = self._to_text(resp)
+
+            # Extract all <think>...</think> blocks
+            steps = re.findall(r"<think>(.*?)</think>", text, flags=re.DOTALL | re.IGNORECASE)
+
+            # Remove all <think>...</think> from the original
+            cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+
+            cleaned_responses.append(cleaned)
+            reasoning_steps.append(steps if steps else [])
+
+        return cleaned_responses, reasoning_steps
+
+    def normalise(self, text: str) -> str:
+        # Unicode NFKD normalization & strip diacritics
+        text = unicodedata.normalize("NFKD", text)
+        text = "".join(c for c in text if not unicodedata.combining(c))
+
+        # case-fold for full Unicode case-insensitive matching
+        text = text.casefold()
+
+        # replace parentheses and other delimiters with spaces
+        text = re.sub(r"[–—_/\\\[\]\(\)\{\};\-]", " ", text)
+
+        # remove anything that’s not a letter, digit, mark, space, percent or comma
+        #    keep commas so we can split on them later
+        cleaned = []
+        for c in text:
+            cat = unicodedata.category(c)
+            if cat[0] in ("L", "N", "M") or c.isspace() or c in {"%", ",", ":"}:
+                cleaned.append(c)
+            # else drop it
+        text = "".join(cleaned)
+
+        # collapse any run of whitespace into a single space
+        return re.sub(r"\s+", " ", text).strip()
+
+    
+    def _list_match_letter_or_text(
+                                    self,
+                                    expected_values,
+                                    raw_resp,
+                                    letter_to_text,
+                                    options,
+                                ):
+        """
+        Determine match type for multi-select (list) questions directly from raw_resp.
+        Returns (match_type, malformed, predicted_values), where predicted_values is the
+        list of normalized option texts that were detected (in the order seen).
+        """
+        
+        raw_resp = raw_resp.split("\n\n")[0].strip()
+
+        expected_set = {self.normalise(v) for v in expected_values}
+
+        norm_opts_set = {self.normalise(o) for o in options}
+        norm_predicted_items = {self.normalise(seg) for seg in re.split(r",\s*", raw_resp) if seg.strip()}
+        if norm_predicted_items and norm_predicted_items.issubset(norm_opts_set):
+            return "full", False, list(norm_predicted_items), []
+
+        # Strip parentheses and prepare raw segments
+        cleaned = re.sub(r"[()]", "", raw_resp)
+
+        # build a regex class from your actual option letters (so J gets picked up too)
+        letters = "".join(letter_to_text.keys())            # e.g. "ABCDEFGHIJ"
+        letter_pattern = rf"([{letters}])[:\.]\s*(.+?)(?=(?:\s*[{letters}][\:\.])|$)"
+        matches = re.findall(letter_pattern, cleaned, flags=re.IGNORECASE)
+
+        if matches:
+            # if there's exactly one letter-prefix but it contains commas,
+            # drop the "A:" and split the contents into separate items
+            if len(matches) == 1 and "," in matches[0][1]:
+                raw_list = matches[0][1]
+                base_segments = [
+                    item.strip().rstrip(",")
+                    for item in raw_list.split(",")
+                    if item.strip()
+                ]
+            else:
+                base_segments = [
+                    f"{ltr}: {txt.strip().rstrip(',').strip()}"
+                    for ltr, txt in matches
+                ]
+        else:
+            base_segments = [
+                seg.strip().rstrip(",")
+                for seg in cleaned.split(",")
+                if seg.strip()
+            ]
+
+        #  # Clean up parentheses & trailing periods
+        # cleaned = re.sub(r"[()]", "", raw_resp).rstrip()
+
+        # # Build a regex class for your actual letters:
+        # #    if letter_to_text has keys "A".."Q", this becomes "[A-Q]"
+        # letter_class = "[" + "".join(letter_to_text.keys()) + "]"
+
+        # #  Split on any "<LETTER>:" or "<LETTER>." prefix
+        # parts = re.split(rf"\s*{letter_class}\s*[:\.]\s*", cleaned)
+
+        # # parts[0] is the text before the first prefix (usually empty), so drop it
+        # raw_segments = parts[1:]
+
+        # # Strip *all* trailing punctuation, lowercase, normalise
+        # base_segments = [
+        #     seg.strip().rstrip(".,;:") 
+        #     for seg in raw_segments 
+        #     if seg.strip()
+        # ]
+
+        # Normalized option map and max comma span for reconstruction
+        opt_norm = {self.normalise(o): o for o in options}
+        norm_opts_set = set(opt_norm.keys()) 
+        max_parts = max(o.count(",") + 1 for o in options)
+
+        has_composite_options = any("," in o for o in options)
+        segments = []  
+        unmatched_segments = []
+        if has_composite_options:
+            i = 0
+            while i < len(base_segments):
+                if has_composite_options:
+                    found = False
+                    for window in range(max_parts, 0, -1):
+                        if i + window > len(base_segments):
+                            continue
+                        candidate = ", ".join(base_segments[i:i + window])
+                        norm_candidate = self.normalise(candidate)
+                        if norm_candidate in opt_norm:
+                            segments.append(opt_norm[norm_candidate])
+                            i += window
+                            found = True
+                            break
+                    if not found:
+                        norm_single = self.normalise(base_segments[i])
+                        if norm_single in opt_norm:
+                            segments.append(opt_norm[norm_single])
+                        else:
+                            segments.append(base_segments[i])  # preserve original for fallback match
+                        i += 1
+                else:
+                    norm_seg = self.normalise(base_segments[i])
+                    segments.append(opt_norm.get(norm_seg, norm_seg))
+                    i += 1
+        else:
+            for seg in base_segments:
+                norm_seg = self.normalise(seg)
+                segments.append(opt_norm.get(norm_seg, norm_seg))
+
+
+        predicted_values = []
+        pred_letters = set()
+        pred_texts = set()
+        malformed = False
+        match_type = "none"
+
+        for seg in segments:
+            seg_matched = False
+
+            # pure letter → letter-only match
+            if re.fullmatch(r"[A-Za-z]", seg):
+                L = seg.upper()
+                if L in letter_to_text:
+                    txt = self.normalise(letter_to_text[L])
+                    predicted_values.append(txt)
+                    pred_letters.add(L)
+                    seg_matched = True
+                    if match_type == "none":
+                        match_type = "letter"
+
+            # letter:text → mixed match
+            m = re.match(r"^([A-Za-z])[:\.]\s*(.+)$", seg)
+            if m:
+                L = m.group(1).upper()
+                # strip trailing commas before normalising
+                candidate = m.group(2).strip().rstrip(",").strip()
+                norm_txt = self.normalise(candidate)
+
+                # exact letter→text
+                if L in letter_to_text and self.normalise(letter_to_text[L]) == norm_txt:
+                    predicted_values.append(norm_txt)
+                    pred_letters.add(L)
+                    pred_texts.add(norm_txt)
+                    seg_matched = True
+                    match_type = "mixed"
+
+                # fallback: if the raw text itself is a valid option, take it
+                elif norm_txt in opt_norm:
+                    predicted_values.append(norm_txt)
+                    pred_texts.add(norm_txt)
+                    seg_matched = True
+                    if match_type == "none":
+                        match_type = "full"
+                    elif match_type == "letter":
+                        match_type = "mixed"
+
+                # cleanup
+                seg = seg.replace(":", "").strip()
+
+            # free-text → full-text match
+            if not seg_matched:
+                norm_seg = self.normalise(seg)
+                if norm_seg in opt_norm:
+                    predicted_values.append(norm_seg)
+                    pred_texts.add(norm_seg)
+                    seg_matched = True
+                    if match_type == "none":
+                        match_type = "full"
+                    elif match_type == "letter":
+                        match_type = "mixed"
+
+            # if nothing matched
+            if not seg_matched:
+                # Only mark malformed if the segment is not even in the normalized options
+                norm_seg = self.normalise(seg)
+                predicted_values.append(norm_seg)
+
+                if norm_seg not in norm_opts_set:
+                    unmatched_segments.append((seg, norm_seg))
+                    malformed = True
+                    # print(f"[MALFORMED] HALLUCINATED RESPONSE DETECTED! - Raw response: '{raw_resp}'")
+                    # print(f"  → norm_seg: '{norm_seg}'")
+                    # print(f"  → norm_opts_set: {sorted(norm_opts_set)}")
+                    # for orig, norm in unmatched_segments:
+                    #     print(f"  → Segment '{orig}' normalized to '{norm}' not in options.")
+
+        # override to full if exact match
+        # Final match type resolution
+
+        if set(predicted_values) == expected_set:
+            match_type = "full"
+
+        return match_type, malformed, predicted_values, unmatched_segments
+
+
+
+    
+    def _mc_match_letter_or_text(self, expected_answer, prediction, options):
+        """
+        Determine match type for multiple-choice predictions:
+        - 'full': predicted text matches correct option text
+        - 'letter': predicted letter matches correct letter
+        - 'mixed': both letter and text given and correct
+        - 'none': neither letter nor text matches
+        - 'invalid': more than one answer detected
+
+        Only one correct answer is allowed for multiple-choice.
+        """
+        # Immediate full-text match check
+        if prediction == expected_answer:
+            return "full"
+        
+        # Build letter → option text mapping
+        if isinstance(options, list):
+            options = {chr(65 + i): opt for i, opt in enumerate(options)}
+        norm_options = {k: self.normalise(v) for k, v in options.items()}
+        rev_options = {v: k for k, v in norm_options.items()}  # normalized text → letter
+        
+
+        expected_answer_norm = self.normalise(expected_answer)
+        expected_letter = rev_options.get(expected_answer_norm, None)
+        prediction_raw = self._to_text(prediction).strip()
+
+        # Split on commas to detect multi-option answers
+        # splits = [s.strip() for s in prediction_raw.split(",") if s.strip()]
+        # if len(splits) > 1:
+        #     return "invalid"  # multiple answers not allowed for MC
+
+        prediction = self.normalise(self._to_text(prediction))
+
+
+        # Direct full-text match
+        is_full = prediction == expected_answer
+
+        # Direct letter match
+        is_letter = prediction.upper() in options and prediction.upper() == expected_letter
+
+        # Mixed form: e.g., "A: Hypertension"
+        if ":" in prediction_raw:
+            parts = prediction_raw.split(":", 1)
+            ltr = parts[0].strip().upper()
+            txt = parts[1].strip().lower()
+            mixed_valid = (
+                ltr in options and
+                txt == options[ltr].strip().lower() and
+                ltr == expected_letter and
+                txt == expected_answer
+            )
+            if mixed_valid:
+                return "mixed"
+
+        if is_full and is_letter:
+            return "mixed"
+        elif is_full:
+            return "full"
+        elif is_letter:
+            return "letter"
+        else:
+            return "none"
+
+
+
     def compute_classification_metrics(self, y_true, y_pred, average="binary", labels=None):
         try:
             precision = precision_score(y_true, y_pred, average=average, labels=labels, zero_division=0)
@@ -378,11 +716,12 @@ class ClinIQLinkSampleDatasetEvaluate:
         Compute precision, recall, and F1 score for list-type answers.
         """
         try:
-            true_set = set(map(str, true_list))
-            pred_set = set(map(str, pred_list))
-            tp = len(true_set & pred_set)
-            fp = len(pred_set - true_set)
-            fn = len(true_set - pred_set)
+            true_counter = Counter(map(str, true_list))
+            pred_counter = Counter(map(str, pred_list))
+
+            tp = sum(min(true_counter[k], pred_counter[k]) for k in pred_counter if k in true_counter)
+            fp = sum(pred_counter[k] - true_counter.get(k, 0) for k in pred_counter if k not in true_counter or pred_counter[k] > true_counter[k])
+            fn = sum(true_counter[k] - pred_counter.get(k, 0) for k in true_counter if k not in pred_counter or true_counter[k] > pred_counter.get(k, 0))
             precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
             recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
             f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
@@ -394,10 +733,15 @@ class ClinIQLinkSampleDatasetEvaluate:
 
     def evaluate_true_false(self, expected, prediction):
         """
-        Evaluate True/False questions: returns 1 if answers match, else 0.
+        Evaluate True/False questions: returns 1.0 if normalized answers match, else 0.0.
+        Normalization includes lowercasing, trimming whitespace, and removing trailing punctuation.
         """
         try:
-            return 1.0 if expected.strip().lower() == prediction.strip().lower() else 0.0
+            def normalize(ans):
+                ans = ans.strip().lower()
+                return ans.rstrip(string.punctuation)  # Remove trailing punctuation
+
+            return 1.0 if normalize(expected) == normalize(prediction) else 0.0
         except Exception as e:
             print(f"Error evaluating True/False question: {e}", flush=True)
             return 0.0
@@ -676,48 +1020,80 @@ class ClinIQLinkSampleDatasetEvaluate:
         """
         True/False (yes‑no) questions are scored with **accuracy** –
         the proportion of items answered exactly correctly.
+        Also records how many responses were malformed (i.e., not 'true' or 'false').
+        **True / False** - *Accuracy*  
+        accuracy = #correct / N 
+        Invalid responses (not “true” or “false”) are flagged and counted
         """
         try:
             blob = self.output_data.get("true_false")
             if not blob:
                 print("No True/False output data found.", flush=True)
-                return {"accuracy": 0.0, "scores": {}}
+                return {"accuracy": 0.0, "true_false_invalid_count": 0, "scores": {}}
 
-            inputs       = blob.get("inputs", [])
-            predictions  = blob.get("responses", [])
+            inputs      = blob.get("inputs", [])
+            predictions = blob.get("responses", [])
 
             if len(inputs) != len(predictions):
                 print("Mismatch in number of inputs and predictions.", flush=True)
-                return {"accuracy": 0.0, "scores": {}}
+                return {"accuracy": 0.0, "true_false_invalid_count": 0, "scores": {}}
 
-            results     = {}
+            results = {}
             correct_cnt = 0
+            invalid_count = 0
 
             for gold, pred in zip(inputs, predictions):
-                expected   = str(gold.get("answer", "")).strip().lower()
-                predicted  = self._to_text(pred).strip().lower()
+                # pull out the canonical expected
+                expected = str(gold.get("answer", "")).strip().lower()
 
-                is_correct = expected == predicted
-                correct_cnt += int(is_correct)
+                raw_resp = self._to_text(pred).strip()
 
+                #  try to match “true” or “false” at the very start
+                m = re.match(r'^(true|false)', raw_resp, flags=re.IGNORECASE)
+                if m:
+                    predicted = m.group(1).lower()
+                    # anything beyond that is “extra”
+                    extra = raw_resp[len(m.group(0)):].strip()
+                    # mark malformed if there *is* any extra text
+                    malformed = bool(extra)
+                else:
+                    # neither “true” nor “false” at the front → invalid + malformed
+                    predicted = ""
+                    malformed = True
+
+                # validity check (only count as invalid if it's not true/false at all)
+                if predicted not in {"true", "false"}:
+                    invalid_count += 1
+                    is_correct = False
+                else:
+                    is_correct = (predicted == expected)
+                    correct_cnt += int(is_correct)
+
+                # build your result entry (raw_resp still carries the full text)
                 para_id = gold.get("source", {}).get("paragraph_id", "unknown")
                 results[para_id] = {
-                    "question":  gold.get("question", ""),
-                    "expected":  expected,
-                    "predicted": predicted,
-                    "correct":   is_correct,
-                    "source":    gold.get("source", {})
+                    "question":     gold.get("question", ""),
+                    "expected":     expected,
+                    "raw response": raw_resp,
+                    "predicted":    predicted,
+                    "correct":      is_correct,
+                    "malformed":    malformed,
+                    "source":       gold.get("source", {}),
                 }
 
             accuracy = correct_cnt / len(inputs) if inputs else 0.0
-            print(f"True/False Accuracy: {accuracy:.3f}", flush=True)
+            print(f"True/False Accuracy: {accuracy:.3f}  |  Invalid Predictions: {invalid_count} / {len(inputs)}", flush=True)
 
-            return {"accuracy": accuracy, "scores": results}
+            return {
+                "accuracy": accuracy,
+                "true_false_invalid_count": invalid_count,
+                "scores": results
+            }
 
         except Exception as e:
             print(f"Error evaluating True/False questions: {e}", flush=True)
-            return {"accuracy": 0.0, "scores": {}}
-
+            return {"accuracy": 0.0, "true_false_invalid_count": 0, "scores": {}}
+        
 
     # def evaluate_multiple_choice_questions(self):
     #     """
@@ -725,7 +1101,7 @@ class ClinIQLinkSampleDatasetEvaluate:
     #     Returns average score, precision, recall, F1, and per-question results.
     #     """
 
-    #     def normalise(text: str) -> str:
+    #     def self.normalise(text: str) -> str:
     #         """Lowercase, strip, collapse whitespace, remove most punctuation."""
     #         text = re.sub(r"[^\w\s%]", "", text.lower())
     #         return re.sub(r"\s+", " ", text).strip()
@@ -761,8 +1137,8 @@ class ClinIQLinkSampleDatasetEvaluate:
     #                 else:
     #                     expected_orig = correct_raw
 
-    #                 expected_text = normalise(expected_orig)
-    #                 predicted_text = normalise(self._to_text(pred))
+    #                 expected_text = self.normalise(expected_orig)
+    #                 predicted_text = self.normalise(self._to_text(pred))
 
     #                 score = 1.0 if predicted_text == expected_text else 0.0
     #                 raw_scores.append(score)
@@ -810,122 +1186,433 @@ class ClinIQLinkSampleDatasetEvaluate:
 
     def evaluate_multiple_choice_questions(self):
         """
-        Multiple‑choice questions are scored with **accuracy** –
-        the fraction of questions where the selected option is exactly correct.
-        """
-        def normalise(text: str) -> str:
-            text = re.sub(r"[^\w\s%]", "", text.lower())
-            return re.sub(r"\s+", " ", text).strip()
+        Multiple‑choice questions are scored with:
+        - Accuracy: match after text normalization
+        - Full match: prediction matches full correct answer text
+        - Letter match: prediction matches correct letter
+        - Mixed match: both letter and text are present and correct 
+        Also tracks malformed predictions:  
+        - multiple answers (e.g., “A, B”)  
+        - mismatched letter/text (e.g., “A: Hypertension” but A ≠ Hypertension) 
+        - Computes:
+        • Overall accuracy (normalized text match)
+        • Full match accuracy (match_type == 'full')
+        • Combined match accuracy (match_type ∈ {'letter', 'mixed'})
+        • Invalid prediction count
+        • Match-type counts: full, letter, mixed, total
+    """
 
         try:
             blob = self.output_data.get("multiple_choice")
             if not blob:
                 print("No Multiple Choice output data found.", flush=True)
-                return {"accuracy": 0.0, "scores": {}}
-
-            inputs      = blob.get("inputs", [])
-            predictions = blob.get("responses", [])
-
-            if len(inputs) != len(predictions):
-                print("Mismatch in number of inputs and predictions.", flush=True)
-                return {"accuracy": 0.0, "scores": {}}
-
-            results     = {}
-            correct_cnt = 0
-
-            for gold, pred in zip(inputs, predictions):
-                # Build {letter → option_text} if needed
-                opts = gold.get("options", {})
-                if isinstance(opts, list):
-                    opts = {chr(65 + i): o for i, o in enumerate(opts)}
-
-                gold_raw = str(gold.get("correct_answer", "")).strip()
-                gold_txt = opts.get(gold_raw.upper(), gold_raw)
-                expected = normalise(gold_txt)
-
-                predicted_txt = normalise(self._to_text(pred))
-
-                is_correct = predicted_txt == expected
-                correct_cnt += int(is_correct)
-
-                para_id = gold.get("source", {}).get("paragraph_id", "unknown")
-                results[para_id] = {
-                    "question":  gold.get("question", ""),
-                    "expected":  gold_txt,
-                    "predicted": self._to_text(pred),
-                    "correct":   is_correct,
-                    "options":   opts,
-                    "source":    gold.get("source", {})
+                return {
+                    "multiple_choice_average": 0.0,
+                    "multiple_choice_full_match_average": 0.0,
+                    "multiple_choice_combined_match_average": 0.0,
+                    "multiple_choice_invalid_count": 0,
+                    "multiple_choice_full_match": 0.0,
+                    "multiple_choice_letter_match": 0.0,
+                    "multiple_choice_mixed_match": 0.0,
+                    "scores": {}
                 }
-
-            accuracy = correct_cnt / len(inputs) if inputs else 0.0
-            print(f"Multiple‑Choice Accuracy: {accuracy:.3f}", flush=True)
-
-            return {"accuracy": accuracy, "scores": results}
-
-        except Exception as e:
-            print(f"Error evaluating Multiple Choice questions: {e}", flush=True)
-            return {"accuracy": 0.0, "scores": {}}
-
-
-    def evaluate_list_questions(self):
-        """
-        Evaluate all List questions.
-        - Extracts option letters (A, B, ...) from prediction using regex.
-        - Maps expected values to their corresponding letters.
-        - Computes precision, recall, and F1 score using predicted vs expected letters.
-        - Returns per-item results and overall averages.
-        """
-        try:
-            blob = self.output_data.get("list")
-            if not blob:
-                print("No List output data found.", flush=True)
-                return {"average": 0.0, "precision": 0.0, "recall": 0.0, "f1_score": 0.0, "scores": {}}
 
             inputs = blob.get("inputs", [])
             predictions = blob.get("responses", [])
 
             if len(inputs) != len(predictions):
                 print("Mismatch in number of inputs and predictions.", flush=True)
-                return {"average": 0.0, "precision": 0.0, "recall": 0.0, "f1_score": 0.0, "scores": {}}
+                return {
+                    "multiple_choice_average": 0.0,
+                    "multiple_choice_full_match_average": 0.0,
+                    "multiple_choice_combined_match_average": 0.0,
+                    "multiple_choice_invalid_count": 0,
+                    "multiple_choice_full_match": 0.0,
+                    "multiple_choice_letter_match": 0.0,
+                    "multiple_choice_mixed_match": 0.0,
+                    "scores": {}
+                }
+
+            total = len(inputs)
+            overall_correct = 0
+            full_match_correct = 0
+            combined_match_correct = 0
+            invalid_count = 0
+
+            match_counts = {"full": 0, "letter": 0, "mixed": 0, "total": 0}
+            results = {}
+
+            for gold, pred in zip(inputs, predictions):
+                opts = gold.get("options", [])
+                opts = {chr(65 + i): o for i, o in enumerate(opts)}
+
+                gold_raw = str(gold.get("correct_answer", "")).strip()
+                gold_txt = opts.get(gold_raw.upper(), gold_raw)
+                expected_text = self.normalise(gold_txt)
+
+                predicted_raw = self._to_text(pred)
+                predicted_text = self.normalise(predicted_raw)
+
+                match_type = self._mc_match_letter_or_text(expected_text, predicted_text, opts)
+
+                malformed = False
+                if match_type == "invalid":
+                    invalid_count += 1
+                    malformed = True
+                else:
+                    if match_type in match_counts:
+                        match_counts[match_type] += 1
+                    match_counts["total"] += 1
+
+                is_correct = predicted_text == expected_text
+                overall_correct += int(is_correct)
+                if match_type == "full":
+                    full_match_correct += 1
+                if match_type in {"letter", "mixed"}:
+                    combined_match_correct += 1
+
+                para_id = gold.get("source", {}).get("paragraph_id", "unknown")
+                results[para_id] = {
+                    "question": gold.get("question", ""),
+                    "expected": gold_txt,
+                    "raw response": predicted_raw,
+                    "predicted": predicted_raw,
+                    "match_type": match_type,
+                    "malformed": malformed,
+                    "options": opts,
+                    "source": gold.get("source", {}),
+                }
+
+            overall_avg = overall_correct / total if total else 0.0
+            full_avg = full_match_correct / total if total else 0.0
+            combined_avg = combined_match_correct / total if total else 0.0
+
+            print("\n==================== Multiple-Choice Evaluation Summary ====================")
+            print(f"→ Overall Average Accuracy:         {overall_avg:.4f}")
+            print(f"→ Full Match Accuracy:              {full_avg:.4f}")
+            print(f"→ Letter + Mixed Match Accuracy:    {combined_avg:.4f}")
+            print(f"→ Invalid Predictions:              {invalid_count} / {total}", flush=True)
+            print(f"→ Match Type Distribution:")
+            print(f"   • Full:    {match_counts['full']}")
+            print(f"   • Letter:  {match_counts['letter']}")
+            print(f"   • Mixed:   {match_counts['mixed']}")
+            print(f"   • Total:   {match_counts['total']}", flush=True)
+
+            return {
+                "multiple_choice_average": overall_avg,
+                "multiple_choice_full_match_average": full_avg,
+                "multiple_choice_combined_match_average": combined_avg,
+                "multiple_choice_invalid_count": invalid_count,
+                "multiple_choice_full_match": match_counts["full"] / match_counts["total"] if match_counts["total"] else 0.0,
+                "multiple_choice_letter_match": match_counts["letter"] / match_counts["total"] if match_counts["total"] else 0.0,
+                "multiple_choice_mixed_match": match_counts["mixed"] / match_counts["total"] if match_counts["total"] else 0.0,
+                "scores": results
+            }
+
+        except Exception as e:
+            print(f"Error evaluating Multiple Choice questions: {e}", flush=True)
+            return {
+                "multiple_choice_average": 0.0,
+                "multiple_choice_full_match_average": 0.0,
+                "multiple_choice_combined_match_average": 0.0,
+                "multiple_choice_invalid_count": 0,
+                "multiple_choice_full_match": 0.0,
+                "multiple_choice_letter_match": 0.0,
+                "multiple_choice_mixed_match": 0.0,
+                "scores": {}
+            }
+
+
+    def compute_macro_micro_metrics(self, expected_sets, predicted_sets):
+        """
+        Compute macro and micro precision/recall/F1 metrics using sklearn.
+
+        Args:
+            expected_sets (List[Set[str]]): Ground truth answers per question.
+            predicted_sets (List[Set[str]]): Predicted answers per question.
+
+        Returns:
+            Dict[str, float]: Dictionary with macro/micro precision, recall, F1
+        """
+        mlb = MultiLabelBinarizer()
+        # teach it every label we'll ever see
+        mlb.fit(expected_sets + predicted_sets)
+
+        y_true = mlb.transform(expected_sets)
+        y_pred = mlb.transform(predicted_sets)
+
+
+        scores = {}
+
+        for avg in ["macro", "micro"]:
+            p, r, f1, _ = precision_recall_fscore_support(
+                y_true, y_pred, average=avg, zero_division=0
+            )
+            scores[f"{avg}_precision"] = p
+            scores[f"{avg}_recall"] = r
+            scores[f"{avg}_f1_score"] = f1
+
+        return scores
+    
+    def compute_mrr(self, predicted: list[list[str]], ground_truth: list[list[str]]) -> float:
+        reciprocal_ranks = []
+        for preds, gold in zip(predicted, ground_truth):
+            gold_set = set(gold)
+            rank = next((i + 1 for i, p in enumerate(preds) if p in gold_set), None)
+            reciprocal_ranks.append(1 / rank if rank else 0.0)
+        return sum(reciprocal_ranks) / len(reciprocal_ranks) if reciprocal_ranks else 0.0
+
+
+    def compute_map(self, predicted: list[list[str]], ground_truth: list[list[str]]) -> float:
+        average_precisions = []
+        for preds, gold in zip(predicted, ground_truth):
+            gold_set = set(gold)
+            num_hits = 0
+            precisions = []
+            for i, p in enumerate(preds):
+                if p in gold_set:
+                    num_hits += 1
+                    precisions.append(num_hits / (i + 1))
+            average_precisions.append(sum(precisions) / len(gold_set) if gold_set else 0.0)
+        return sum(average_precisions) / len(average_precisions) if average_precisions else 0.0
+
+
+    def compute_precision_at_k(self, predicted: list[list[str]], ground_truth: list[list[str]], k: int = 5) -> float:
+        p_at_k = []
+        for preds, gold in zip(predicted, ground_truth):
+            gold_set = set(gold)
+            top_k_preds = preds[:k]
+            hits = sum(1 for p in top_k_preds if p in gold_set)
+            p_at_k.append(hits / k)
+        return sum(p_at_k) / len(p_at_k) if p_at_k else 0.0
+
+    def compute_additional_ir_metrics(self, expected_sets, predicted_lists, results, match_type_filter=None):
+        """
+        Compute IR-style metrics (MAP, MRR, P@5) optionally filtered by match_type.
+
+        Args:
+            expected_sets (List[Set[str]]): Gold labels.
+            predicted_lists (List[List[str]]): Ranked predicted answers.
+            results (Dict): Full QA record per item.
+            match_type_filter (Set[str] or None): Match types to include.
+
+        Returns:
+            Dict[str, float]: {"map": ..., "mrr": ..., "p@5": ...}
+        """
+        filtered_expected = []
+        filtered_predicted = []
+
+        for para_id, r in results.items():
+            if match_type_filter and r.get("match_type") not in match_type_filter:
+                continue
+            filtered_expected.append(r["expected"])
+            filtered_predicted.append(r["predicted"])
+
+        map_score = self.compute_map(filtered_predicted, filtered_expected)
+        mrr_score = self.compute_mrr(filtered_predicted, filtered_expected)
+        p_at_5 = self.compute_precision_at_k(filtered_predicted, filtered_expected, k=5)
+
+        return {
+            "map": map_score,
+            "mrr": mrr_score,
+            "p@5": p_at_5,
+        }
+
+    def evaluate_list_questions(self):
+        """
+        Evaluate all List questions.
+        Includes standard macro/micro F1 as well as:
+        - full match (text-only)
+        - letter match (A, B, C...)
+        - mixed match (letter + text both correct)
+        **List (multi-select)** - token-level  **Macro & Micro F1**  
+        Invalid predictions (e.g., text not matching any shown options) are counted separately.
+        """
+
+        try:
+            blob = self.output_data.get("list")
+            if not blob:
+                print("No List output data found.", flush=True)
+                return {
+                    "average": 0.0, "macro_precision": 0.0, "macro_recall": 0.0, "macro_f1_score": 0.0,
+                    "micro_precision": 0.0, "micro_recall": 0.0, "micro_f1_score": 0.0,
+                    "list_full_match": 0.0, "list_letter_match": 0.0, "list_mixed_match": 0.0,
+                    "list_invalid_count":0, "scores": {}
+                }
+
+            inputs = blob.get("inputs", [])
+            predictions = blob.get("responses", [])
+
+            if len(inputs) != len(predictions):
+                print("Mismatch in number of inputs and predictions.", flush=True)
+                return {
+                    "average": 0.0, "macro_precision": 0.0, "macro_recall": 0.0, "macro_f1_score": 0.0,
+                    "micro_precision": 0.0, "micro_recall": 0.0, "micro_f1_score": 0.0,
+                    "list_full_match": 0.0, "list_letter_match": 0.0, "list_mixed_match": 0.0,
+                    "list_invalid_count":0, "scores": {}
+                }
 
             results = {}
             precision_list = []
             recall_list = []
             f1_list = []
+            invalid_count = 0
             global_tp, global_fp, global_fn = 0, 0, 0
 
+            match_counts = {"full": 0, "letter": 0, "mixed": 0, "total": 0}
 
             for gold, raw_pred in zip(inputs, predictions):
                 try:
-                    options = [opt.strip().lower() for opt in gold.get("options", [])]
-                    expected_values = [v.strip().lower() for v in gold.get("answer", [])]
+                    options_raw = gold.get("options", [])
+                    options = [self.normalise(opt) for opt in options_raw]
 
-                    # Model output → list of option texts
-                    pred_text = self._to_text(raw_pred).strip().lower()
-                    predicted_values = [p.strip() for p in pred_text.split(",") if p.strip()]
+                    expected_values = [self.normalise(v) for v in gold.get("answer", [])]
 
-                    # Compute overlap metrics
-                    precision, recall, f1 = self.compute_overlap_f1(expected_values, predicted_values)
+                    # -------------------- these steps have been added in to ensure that any issues with the list type questions where the letter options are 
+                    # -------------------- evident within the answer options (WHICH SHOULD HAVE BEEN PICKED UP BY THE GOD DAM FUCKING ANNOTATORS) are fixed / scrubbed
+                    # -------------------- NOTE - this is some hamburger ass code - this is just a workaround to temp fix the issue. To really fix this, we will need to 
+                    # -------------------- go back through the original data and remove any of these malformations from the dataset (that REALLY the annotators should have picked up)
+                    options_stripped = [
+                        re.sub(r"^(?:[A-H]\. |[A-H]: )", "", opt).strip()
+                        for opt in options_raw
+                    ]
 
-                    # Global precision/recall counts
-                    tp = len(set(expected_values) & set(predicted_values))
-                    fp = len(set(predicted_values) - set(expected_values))
-                    fn = len(set(expected_values) - set(predicted_values))
+                    # now build your clean maps off of options_stripped
+                    letter_to_text = {
+                        chr(65 + i): options_stripped[i]
+                        for i in range(len(options_stripped))
+                    }
+                    text_to_letter = {
+                        self.normalise(txt): ltr
+                        for ltr, txt in letter_to_text.items()
+                    }
+                    # and rebuild your expected_values from gold["answer"]:
+                    expected_clean = []
+                    for v in gold.get("answer", []):
+                        v = v.strip()
+                        # if it’s just a letter, map it:
+                        if len(v) == 1 and v.upper() in letter_to_text:
+                            expected_clean.append(letter_to_text[v.upper()])
+                        else:
+                            # maybe it’s "c prostatectomy" — drop the leading "c "
+                            m = re.match(r"^([A-Za-z])[\.:]?\s+(.+)$", v)
+                            if m and m.group(1).upper() in letter_to_text:
+                                expected_clean.append(m.group(2))
+                            else:
+                                # otherwise assume it really is the full text already
+                                expected_clean.append(v)
+                    # finally normalize
+                    expected_values = [self.normalise(x) for x in expected_clean]
+
+                    # Normalize & parse the raw response by first splitting on commas
+                    raw_resp = self._to_text(raw_pred)
+
+                    # Match type
+                    match_type, malformed, predicted_values, unmatched_segments = self._list_match_letter_or_text(
+                                                                        expected_values, 
+                                                                        raw_resp, 
+                                                                        letter_to_text, 
+                                                                        options_stripped
+                                                                    )
+                    # if it was malformed, immediately zero everything out
+                    if malformed:
+                        invalid_count += 1
+                        # Normalize unmatched segments and treat as predicted
+                        hallucinated = {self.normalise(seg) for seg, norm in unmatched_segments}
+                        pred_set = hallucinated
+                        true_set = set(expected_values)
+
+                        tp = 0  # no correct predictions allowed in malformed
+                        fp = len(pred_set)
+                        fn = len(true_set)
+
+                        global_tp += tp
+                        global_fp += fp
+                        global_fn += fn
+
+                        precision = 0.0 if fp + tp == 0 else tp / (tp + fp)
+                        recall = 0.0 if fn + tp == 0 else tp / (tp + fn)
+                        f1 = 0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
+
+                        precision_list.append(precision)
+                        recall_list.append(recall)
+                        f1_list.append(f1)
+
+                    else:
+                        # count only the non‐malformed
+                        if match_type in match_counts:
+                            match_counts[match_type] += 1
+                        match_counts["total"] += 1
+
+                        # Compute per-item precision/recall/F1 and build pred_set
+                        if match_type == "full":
+                            precision, recall, f1 = self.compute_overlap_f1(expected_values, predicted_values)
+                            pred_set = set(predicted_values)
+                        elif match_type == "letter":
+                            # expected_letters = [
+                            #     ltr for ltr, opt in letter_to_text.items()
+                            #     if self.normalise(opt) in expected_values
+                            # ]
+                            # pred_letters = [v.upper() for v in predicted_values if v.upper() in letter_to_text]
+                            # pred_set = set(pred_letters)
+                            # precision, recall, f1 = self.compute_overlap_f1(expected_letters, pred_letters)
+                            pred_set = set(predicted_values)
+                            precision, recall, f1 = self.compute_overlap_f1(expected_values, predicted_values)
+
+                        elif match_type == "mixed":
+                            mapped = []
+                            for v in predicted_values:
+                                v = v.strip()
+                                if ":" in v:
+                                    parts = v.split(":", 1)
+                                    if len(parts) != 2:
+                                        continue  # Malformed
+                                    letter = parts[0].strip().upper()
+                                    if letter in letter_to_text:
+                                        mapped_text = letter_to_text[letter].strip().lower()
+                                        mapped.append(mapped_text)
+                                elif len(v) == 1 and v.upper() in letter_to_text:
+                                    mapped_text = letter_to_text[v.upper()].strip().lower()
+                                    mapped.append(mapped_text)
+                                else:
+                                    mapped.append(v.strip().lower())
+
+                            if not mapped:
+                                precision, recall, f1 = 0.0, 0.0, 0.0
+                                pred_set = set()
+                            else:
+                                precision, recall, f1 = self.compute_overlap_f1(expected_values, mapped)
+                                pred_set = set(mapped)
+                            
+                        else:
+                            # even if it didn’t qualify as a “full”/“letter”/“mixed” tidy match,
+                            # still compute overlap F1 on whatever you found
+                            precision, recall, f1 = self.compute_overlap_f1(expected_values, predicted_values)
+                            pred_set = set(predicted_values)
+
+                    # Update global TP/FP/FN
+                    true_set = set(expected_values)
+                    tp = len(true_set & pred_set)
+                    fp = len(pred_set - true_set)
+                    fn = len(true_set - pred_set)
                     global_tp += tp
                     global_fp += fp
                     global_fn += fn
 
+                    # Record this qa pair 
                     para_id = gold.get("source", {}).get("paragraph_id", "unknown")
                     results[para_id] = {
-                        "question": gold.get("question", ""),
-                        "expected": expected_values,
-                        "predicted": predicted_values if predicted_values else pred_text,
-                        "options": options,
-                        "f1_score": f1,
-                        "precision": precision,
-                        "recall": recall,
-                        "source": gold.get("source", {})
+                        "question":   gold.get("question", ""),
+                        "expected":   expected_values,
+                        "raw response": raw_resp,
+                        "predicted":  (predicted_values if predicted_values else [raw_resp]),
+                        "options":    options,
+                        "precision":  precision,
+                        "recall":     recall,
+                        "f1_score":   f1,
+                        "match_type": match_type,
+                        "malformed":  malformed,
+                        "pred_set":   sorted(pred_set),
                     }
 
                     precision_list.append(precision)
@@ -934,32 +1621,176 @@ class ClinIQLinkSampleDatasetEvaluate:
                 except Exception as inner_e:
                     print(f"Error processing List QA: {inner_e}", flush=True)
 
+            # Ground truth and prediction sets for all examples
+            expected_sets_all = [set(r["expected"]) for r in results.values()]
+            predicted_sets_all = [set(r["pred_set"]) for r in results.values()]
 
-            avg_precision = sum(precision_list) / len(precision_list) if precision_list else 0.0
-            avg_recall = sum(recall_list) / len(recall_list) if recall_list else 0.0
-            avg_f1 = sum(f1_list) / len(f1_list) if f1_list else 0.0
+            # F1 scores: overall
+            f1_scores_all = self.compute_macro_micro_metrics(expected_sets_all, predicted_sets_all)
+            avg_precision = f1_scores_all["macro_precision"]
+            avg_recall = f1_scores_all["macro_recall"]
+            avg_f1 = f1_scores_all["macro_f1_score"]
+            micro_precision = f1_scores_all["micro_precision"]
+            micro_recall = f1_scores_all["micro_recall"]
+            micro_f1 = f1_scores_all["micro_f1_score"]
 
-            micro_precision = global_tp / (global_tp + global_fp) if (global_tp + global_fp) > 0 else 0.0
-            micro_recall = global_tp / (global_tp + global_fn) if (global_tp + global_fn) > 0 else 0.0
-            micro_f1 = (2 * micro_precision * micro_recall / (micro_precision + micro_recall)) if (micro_precision + micro_recall) > 0 else 0.0
+            # Full-match only: keep the model’s pred_set for full matches, empty set elsewhere
+            predicted_full_masked = [
+                r["pred_set"] if r["match_type"] == "full" else set()
+                for r in results.values()
+            ]
+            f1_scores_full = self.compute_macro_micro_metrics(expected_sets_all, predicted_full_masked)
 
-            print(f"List Precision: {avg_precision:.2f}, Recall: {avg_recall:.2f}, F1: {avg_f1:.2f}", flush=True)
+            full_match_macro_precision = f1_scores_full["macro_precision"]
+            full_match_macro_recall = f1_scores_full["macro_recall"]
+            full_match_macro_f1 = f1_scores_full["macro_f1_score"]
 
+            full_match_micro_precision = f1_scores_full["micro_precision"]
+            full_match_micro_recall = f1_scores_full["micro_recall"]
+            full_match_micro_f1 = f1_scores_full["micro_f1_score"]
+
+            # Letter+Mixed only: keep the model’s pred_set for letter or mixed, empty set elsewhere
+            predicted_letter_and_mixed_masked = [
+                r["pred_set"] if r["match_type"] in {"letter","mixed"} else set()
+                for r in results.values()
+            ]
+            f1_scores_combined = self.compute_macro_micro_metrics(expected_sets_all, predicted_letter_and_mixed_masked)
+
+            combined_match_macro_precision = f1_scores_combined["macro_precision"]
+            combined_match_macro_recall = f1_scores_combined["macro_recall"]
+            combined_match_macro_f1 = f1_scores_combined["macro_f1_score"]
+
+            combined_match_micro_precision = f1_scores_combined["micro_precision"]
+            combined_match_micro_recall = f1_scores_combined["micro_recall"]
+            combined_match_micro_f1 = f1_scores_combined["micro_f1_score"]
+
+            # Optional IR-style metrics
+            predicted_ranked_lists = [r["predicted"] for r in results.values()]
+            gold_ranked_lists = [r["expected"] for r in results.values()]
+
+            metrics_all = self.compute_additional_ir_metrics(
+                                                                expected_sets_all, 
+                                                                predicted_ranked_lists, 
+                                                                results
+                                                                )
+            
+            metrics_full = self.compute_additional_ir_metrics(
+                                                                expected_sets_all, 
+                                                                predicted_ranked_lists, 
+                                                                results, 
+                                                                match_type_filter={"full"}
+                                                                )
+            
+            metrics_letter_mixed = self.compute_additional_ir_metrics(
+                                                                        expected_sets_all,
+                                                                        predicted_ranked_lists,
+                                                                        results,
+                                                                        match_type_filter={"letter","mixed"}
+                                                                    )
+            total_non_malformed = match_counts['total']
+            strict_matches      = match_counts['full'] + match_counts['letter'] + match_counts['mixed']
+            no_matches          = total_non_malformed - strict_matches
+            match_rate          = (strict_matches / total_non_malformed) if total_non_malformed else 0.0
+
+            print("\n==================== List QA Evaluation Summary ====================")
+            print("→ Overall (all examples):")
+            print(f"  Macro Avg Precision:     {avg_precision:.4f}")
+            print(f"  Macro Avg Recall:        {avg_recall:.4f}")
+            print(f"  Macro Avg F1 Score:      {avg_f1:.4f}")
+            print(f"  Micro Precision:         {micro_precision:.4f}")
+            print(f"  Micro Recall:            {micro_recall:.4f}")
+            print(f"  Micro F1 Score:          {micro_f1:.4f}")
+            print("\n==================== NOTE ====================")
+            print("  NOTE - the below metrics (looking at full and combined matches) takes out No matches (model gave response(s) from options provided but none were right) from the response set.")
+            print(" So the numbers reported for full match + combined <> overall, as they do not include the (negative) results for when the model provided no matches (for non-malformed responses)")
+            print(" The Overall (all examples) metric should be used to evaluate the list type QA's, the below are just provided for internal testing to identify models that ")
+            print(" provided letter / mixed responses when they explicitly told not to! ")
+            print(" If later on, the full text matches are used to evaluate list then the non matches (negative results) MUST be added back into the set prior to computing f1 metrics!!! ")
+            print("\n==================== NOTE ====================")
+            print("\n→ Full-Match Only:")
+            print(f"  Macro Avg Precision:     {full_match_macro_precision:.4f}")
+            print(f"  Macro Avg Recall:        {full_match_macro_recall:.4f}")
+            print(f"  Macro Avg F1 Score:      {full_match_macro_f1:.4f}")
+            print(f"  Micro Precision:         {full_match_micro_precision:.4f}")
+            print(f"  Micro Recall:            {full_match_micro_recall:.4f}")
+            print(f"  Micro F1 Score:          {full_match_micro_f1:.4f}")
+
+            print("\n→ Combined Match (Letter + Mixed):")
+            print(f"  Macro Avg Precision:     {combined_match_macro_precision:.4f}")
+            print(f"  Macro Avg Recall:        {combined_match_macro_recall:.4f}")
+            print(f"  Macro Avg F1 Score:      {combined_match_macro_f1:.4f}")
+            print(f"  Micro Precision:         {combined_match_micro_precision:.4f}")
+            print(f"  Micro Recall:            {combined_match_micro_recall:.4f}")
+            print(f"  Micro F1 Score:          {combined_match_micro_f1:.4f}")
+
+            print("\n→ Match Type Distribution:")
+            print(f"  Total non-malformed responses: {total_non_malformed}")
+            print(f"  Strict matches (full/letter/mixed): {strict_matches}")
+            print(f"  No matches (model gave response(s) from options provided but none were right):                       {no_matches}")
+            print(f"  Strict match rate:                {match_rate:.2%}")
+
+            print(f"  FULL   Match Rate:       {match_counts['full'] / match_counts['total'] if match_counts['total'] else 0.0:.4f}")
+            print(f"  LETTER Match Rate:       {match_counts['letter'] / match_counts['total'] if match_counts['total'] else 0.0:.4f}")
+            print(f"  MIXED  Match Rate:       {match_counts['mixed'] / match_counts['total'] if match_counts['total'] else 0.0:.4f}")
+            print(f"  INVALID Predictions:     {invalid_count} / {len(inputs)}", flush=True)
+
+            print("\n→ IR-Style Metrics:")
+            print(f"  MAP (All):               {metrics_all['map']:.4f}")
+            print(f"  MRR (All):               {metrics_all['mrr']:.4f}")
+            print(f"  P@5 (All):               {metrics_all['p@5']:.4f}")
+
+            print(f"  MAP (Full):              {metrics_full['map']:.4f}")
+            print(f"  MRR (Full):              {metrics_full['mrr']:.4f}")
+            print(f"  P@5 (Full):              {metrics_full['p@5']:.4f}")
+
+            print(f"  MAP (Combined):          {metrics_letter_mixed['map']:.4f}")
+            print(f"  MRR (Combined):          {metrics_letter_mixed['mrr']:.4f}")
+            print(f"  P@5 (Combined):          {metrics_letter_mixed['p@5']:.4f}")
+
+            # Aggregate match-type stats
             return {
-                "average": avg_f1,
-                "macro_precision": avg_precision,
-                "macro_recall": avg_recall,
-                "macro_f1_score": avg_f1,
-                "micro_precision": micro_precision,
-                "micro_recall": micro_recall,
-                "micro_f1_score": micro_f1,
-                "scores": results
+                "list_overall_macro_avg_precision": avg_precision,
+                "list_overall_macro_avg_recall": avg_recall,
+                "list_overall_macro_avg_f1_score": avg_f1,
+                "list_overall_micro_precision": micro_precision,
+                "list_overall_micro_recall": micro_recall,
+                "list_overall_micro_f1_score": micro_f1,
+                "list_full_match_macro_precision": full_match_macro_precision,
+                "list_full_match_macro_recall": full_match_macro_recall,
+                "list_full_match_macro_f1_score": full_match_macro_f1,
+                "list_full_match_micro_precision": full_match_micro_precision,
+                "list_full_match_micro_recall": full_match_micro_recall,
+                "list_full_match_micro_f1_score": full_match_micro_f1,
+                "list_combined_match_macro_precision": combined_match_macro_precision,
+                "list_combined_match_macro_recall": combined_match_macro_recall,
+                "list_combined_match_macro_f1_score": combined_match_macro_f1,
+                "list_combined_match_micro_precision": combined_match_micro_precision,
+                "list_combined_match_micro_recall": combined_match_micro_recall,
+                "list_combined_match_micro_f1_score": combined_match_micro_f1,
+                "list_full_match": match_counts["full"] / match_counts["total"] if match_counts["total"] else 0.0,
+                "list_letter_match": match_counts["letter"] / match_counts["total"] if match_counts["total"] else 0.0,
+                "list_mixed_match": match_counts["mixed"] / match_counts["total"] if match_counts["total"] else 0.0,
+                "list_invalid_count": invalid_count,
+                "list_map": metrics_all["map"],
+                "list_mrr": metrics_all["mrr"],
+                "list_p_at_5": metrics_all["p@5"],
+                "list_map_full": metrics_full["map"],
+                "list_mrr_full": metrics_full["mrr"],
+                "list_p_at_5_full": metrics_full["p@5"],
+                "list_map_combined": metrics_letter_mixed["map"],
+                "list_mrr_combined": metrics_letter_mixed["mrr"],
+                "list_p_at_5_combined": metrics_letter_mixed["p@5"],
+                "scores": results,
             }
-
 
         except Exception as e:
             print(f"Error evaluating List questions: {e}", flush=True)
-            return {"average": 0.0, "precision": 0.0, "recall": 0.0, "f1_score": 0.0, "scores": {}}
+            return {
+                "average": 0.0, "macro_precision": 0.0, "macro_recall": 0.0, "macro_f1_score": 0.0,
+                "micro_precision": 0.0, "micro_recall": 0.0, "micro_f1_score": 0.0,
+                "list_full_match": 0.0, "list_letter_match": 0.0, "list_mixed_match": 0.0,
+                "list_invalid_count":0, "scores": {}
+            }
 
 
     def evaluate_short_questions(self):
@@ -987,6 +1818,7 @@ class ClinIQLinkSampleDatasetEvaluate:
 
             for gold, pred in zip(inputs, predictions):
                 try:
+                    raw_resp = self._to_text(pred)
                     predicted = self._to_text(pred).strip().lower()
                     question  = str(gold.get("question", "")).strip().lower()
                     expected  = str(gold.get("answer", "")).strip()
@@ -1002,6 +1834,7 @@ class ClinIQLinkSampleDatasetEvaluate:
                     results[para_id] = {
                         "question": gold.get("question", ""),
                         "expected": expected,
+                        "raw response": raw_resp,
                         "predicted": predicted,
                         "semantic_match_score": sim_score,
                         "metrics": metrics,
@@ -1051,6 +1884,7 @@ class ClinIQLinkSampleDatasetEvaluate:
 
             for gold, pred in zip(inputs, predictions):
                 try:
+                    raw_resp = self._to_text(pred)
                     predicted = self._to_text(pred).strip().lower()
                     question = str(gold.get("question", "")).strip().lower()
                     expected = str(gold.get("incorrect_explanation", "")).strip()
@@ -1069,6 +1903,7 @@ class ClinIQLinkSampleDatasetEvaluate:
                     results[para_id] = {
                         "question": gold.get("question", ""),
                         "expected": expected,
+                        "raw response": raw_resp,
                         "predicted": predicted,
                         "semantic_match_score": sim_score,
                         "metrics": metrics,
@@ -1118,6 +1953,7 @@ class ClinIQLinkSampleDatasetEvaluate:
 
             for gold, pred in zip(inputs, predictions):
                 try:
+                    raw_resp = self._to_text(pred)
                     predicted = self._to_text(pred).strip().lower()
                     question = str(gold.get("question", "")).strip().lower()
                     expected = str(gold.get("answer", "")).strip()
@@ -1133,6 +1969,7 @@ class ClinIQLinkSampleDatasetEvaluate:
                     results[para_id] = {
                         "question": gold.get("question", ""),
                         "expected": expected,
+                        "raw response": raw_resp,
                         "predicted": predicted,
                         "semantic_match_score": sim_score,
                         "metrics": metrics,
@@ -1213,6 +2050,7 @@ class ClinIQLinkSampleDatasetEvaluate:
             for gold, pred in zip(inputs, predictions):
                 try:
                     # --- ground truth step & explanation ---
+                    raw_resp = self._to_text(pred)
                     irs = gold.get("incorrect_reasoning_step", "")
                     # turn it into a list of non-empty lines
                     if isinstance(irs, list):
@@ -1272,6 +2110,7 @@ class ClinIQLinkSampleDatasetEvaluate:
                     results[para_id] = {
                         "question":              gold.get("question", ""),
                         "expected_step":         gt_step_number,
+                        "raw response":          raw_resp,
                         "predicted_step":        pred_step,
                         "step_distance":         dist,
                         "step_correct":          step_corr,
@@ -1453,63 +2292,119 @@ class ClinIQLinkSampleDatasetEvaluate:
         Run evaluations for all QA types and save results to five category files and one overall summary file.
         """
         try:
-            output_dir = os.path.join(self.base_dir, "evaluation_output")
+            output_dir = os.path.join(self.base_dir, self.output_dir) if not os.path.isabs(self.output_dir) else self.output_dir
             os.makedirs(output_dir, exist_ok=True)
 
-            overall_results = {}
+            overall_results = OrderedDict()
 
-            # Evaluate each QA type individually
+            # # Evaluate each QA type individually
+            # tf_results = self.evaluate_true_false_questions()
+            # mc_results = self.evaluate_multiple_choice_questions()
+            # list_results = self.evaluate_list_questions()
+            # short_results = self.evaluate_short_questions()
+            # short_inverse_results = self.evaluate_short_inverse_questions()
+            # multi_hop_results = self.evaluate_multi_hop_questions()
+            # multi_hop_inverse_results = self.evaluate_multi_hop_inverse_questions()
+
+            # # ---------------------- individual json files ----------------------
+            # # Organize and save grouped results
+            # grouped_outputs = {
+            #     "true_false_results.json": {
+            #         "true_false": tf_results
+            #     },
+            #     "multiple_choice_results.json": {
+            #         "multiple_choice": mc_results
+            #     },
+            #     "list_results.json": {
+            #         "list": list_results
+            #     },
+            #     "short_results.json": {
+            #         "short": short_results,
+            #     },
+            #     "multi_hop_results.json": {
+            #         "multi_hop": multi_hop_results,
+            #     },
+            #     "short_inverse_results.json": {
+            #         "short_inverse": short_inverse_results
+            #     },
+            #     "multi_hop_inverse_results.json": {
+            #         "multi_hop_inverse": multi_hop_inverse_results
+            #     }
+            # }
+
+            # for filename, data in grouped_outputs.items():
+            #     # Inject reasoning steps if they exist
+            #     for task_name, task_data in data.items():
+            #         original_blob = self.output_data.get(task_name, {})
+            #         if "reasoning_model_thinking_steps" in original_blob:
+            #             task_data["reasoning_model_thinking_steps"] = original_blob["reasoning_model_thinking_steps"]
+
+            #     file_path = os.path.join(output_dir, filename)
+            #     with open(file_path, "w") as f:
+            #         json.dump(data, f, indent=4)
+            #     print(f"Saved {filename}", flush=True)
+
+            # mapping: (filename, top‐level key, evaluator method)
+
+            # True/False
             tf_results = self.evaluate_true_false_questions()
+            with open(os.path.join(output_dir, "true_false_results.json"), "w") as f:
+                json.dump({"true_false": tf_results}, f, indent=4)
+            print("Saved true_false_results.json", flush=True)
+
+            # Multiple-Choice
             mc_results = self.evaluate_multiple_choice_questions()
+            with open(os.path.join(output_dir, "multiple_choice_results.json"), "w") as f:
+                json.dump({"multiple_choice": mc_results}, f, indent=4)
+            print("Saved multiple_choice_results.json", flush=True)
+
+            # List
             list_results = self.evaluate_list_questions()
+            with open(os.path.join(output_dir, "list_results.json"), "w") as f:
+                json.dump({"list": list_results}, f, indent=4)
+            print("Saved list_results.json", flush=True)
+
+            # Short
             short_results = self.evaluate_short_questions()
+            with open(os.path.join(output_dir, "short_results.json"), "w") as f:
+                json.dump({"short": short_results}, f, indent=4)
+            print("Saved short_results.json", flush=True)
+
+            # Short-Inverse
             short_inverse_results = self.evaluate_short_inverse_questions()
+            with open(os.path.join(output_dir, "short_inverse_results.json"), "w") as f:
+                json.dump({"short_inverse": short_inverse_results}, f, indent=4)
+            print("Saved short_inverse_results.json", flush=True)
+
+            # Multi-Hop
             multi_hop_results = self.evaluate_multi_hop_questions()
+            with open(os.path.join(output_dir, "multi_hop_results.json"), "w") as f:
+                json.dump({"multi_hop": multi_hop_results}, f, indent=4)
+            print("Saved multi_hop_results.json", flush=True)
+
+            # Multi-Hop Inverse
             multi_hop_inverse_results = self.evaluate_multi_hop_inverse_questions()
+            with open(os.path.join(output_dir, "multi_hop_inverse_results.json"), "w") as f:
+                json.dump({"multi_hop_inverse": multi_hop_inverse_results}, f, indent=4)
+            print("Saved multi_hop_inverse_results.json", flush=True)
 
-            overall_results["multi_hop_inverse_step_identification_rate"] = \
-                multi_hop_inverse_results.get("step_identification_rate", 0.0)
+            # ---------------------- individual json files ----------------------
 
-            # Organize and save grouped results
-            grouped_outputs = {
-                "true_false_results.json": {
-                    "true_false": tf_results
-                },
-                "multiple_choice_results.json": {
-                    "multiple_choice": mc_results
-                },
-                "list_results.json": {
-                    "list": list_results
-                },
-                "short_results.json": {
-                    "short": short_results,
-                },
-                "multi_hop_results.json": {
-                    "multi_hop": multi_hop_results,
-                },
-                "short_inverse_results.json": {
-                    "short_inverse": short_inverse_results
-                },
-                "multi_hop_inverse_results.json": {
-                    "multi_hop_inverse": multi_hop_inverse_results
-                }
+            # ---------------------- Compute match-type metrics early ----------------------
+            mc_match_metrics = {
+                "full_match": mc_results.get("multiple_choice_full_match", 0.0),
+                "letter_match": mc_results.get("multiple_choice_letter_match", 0.0),
+                "mixed_match": mc_results.get("multiple_choice_mixed_match", 0.0),
             }
 
-            # Save each category file
-            for filename, data in grouped_outputs.items():
-                file_path = os.path.join(output_dir, filename)
-                with open(file_path, "w") as f:
-                    json.dump(data, f, indent=4)
-                print(f"Saved {filename}", flush=True)
+            list_match_metrics = {
+                "full_match": list_results.get("list_full_match", 0.0),
+                "letter_match": list_results.get("list_letter_match", 0.0),
+                "mixed_match": list_results.get("list_mixed_match", 0.0),
+            }
 
-            # Merge everything for overall results
-            overall_results["true_false"]        = tf_results
-            overall_results["multiple_choice"]   = mc_results
-            overall_results["list"]              = list_results
-            overall_results["short"]             = short_results
-            overall_results["short_inverse"]     = short_inverse_results
-            overall_results["multi_hop"]         = multi_hop_results
-            overall_results["multi_hop_inverse"] = multi_hop_inverse_results
+            step_id_score = multi_hop_inverse_results.get("step_identification_rate", 0.0)
+
 
             open_ended_metrics = {}
             for name, result in [
@@ -1530,16 +2425,12 @@ class ClinIQLinkSampleDatasetEvaluate:
                     "avg_rouge":  sum(rouges)  / len(rouges)  if rouges  else 0.0,
                 }
 
-            # ─── Compute overall average of those three across all open‑ended types ───
+            # --------------- Compute overall average of those three across all open‑ended types ---------------
             overall_open = {
                 "avg_bleu":   sum(m["avg_bleu"]   for m in open_ended_metrics.values()) / len(open_ended_metrics),
                 "avg_meteor": sum(m["avg_meteor"] for m in open_ended_metrics.values()) / len(open_ended_metrics),
                 "avg_rouge":  sum(m["avg_rouge"]  for m in open_ended_metrics.values()) / len(open_ended_metrics),
             }
-
-            # ─── Attach into your overall_results structure ───
-            overall_results["open_ended_metrics_per_type"] = open_ended_metrics
-            overall_results["open_ended_metrics_overall"]   = overall_open
 
 
             # --------------- gather open‑ended similarity distributions ---------------
@@ -1550,20 +2441,115 @@ class ClinIQLinkSampleDatasetEvaluate:
                 "multi_hop_inverse":[v["semantic_match_score"] for v in multi_hop_inverse_results["scores"].values()],
             }
 
-            # ────── compute single “overall effectiveness” score ──────
+            # --------------- compute single “overall effectiveness” score ---------------
+            # Individual top-level scores (order-preserved)
+            tf_acc   = tf_results.get("accuracy", 0.0)
+            mc_acc   = mc_results.get("accuracy", 0.0)
+            list_f1  = list_results.get("macro_f1_score", 0.0)
+            short_ss = short_results.get("semantic_match_score", 0.0)
+            short_inv_ss = short_inverse_results.get("semantic_match_score", 0.0)
+            hop_ss   = multi_hop_results.get("semantic_match_score", 0.0)
+            hop_inv_ss = multi_hop_inverse_results.get("semantic_match_score", 0.0)
+
+            # to_avg = [tf_acc, mc_acc, list_f1, short_ss, short_inv_ss, hop_ss, hop_inv_ss]
+            ## overall_score = float(np.mean(to_avg))
+
+            # Add per-type and total invalid counts for close-ended types
+            tf_invalid   = tf_results.get("true_false_invalid_count", 0)
+            mc_invalid   = mc_results.get("multiple_choice_invalid_count", 0)
+            list_invalid = list_results.get("list_invalid_count", 0)
+
+            
             to_avg = [
-                overall_results["true_false"]["accuracy"],
-                overall_results["multiple_choice"]["accuracy"],
-                overall_results["list"]["macro_f1_score"],
-                overall_results["short"]["semantic_match_score"],
-                overall_results["short_inverse"]["semantic_match_score"],
-                overall_results["multi_hop"]["semantic_match_score"],
-                overall_results["multi_hop_inverse"]["semantic_match_score"],
+                tf_results.get("accuracy", 0.0),
+                mc_results.get("multiple_choice_average", 0.0),
+                list_results.get("list_overall_macro_avg_f1_score", 0.0),
+                short_results.get("semantic_match_score", 0.0),
+                short_inverse_results.get("semantic_match_score", 0.0),
+                multi_hop_results.get("semantic_match_score", 0.0),
+                multi_hop_inverse_results.get("semantic_match_score", 0.0),
             ]
             overall_score = float(np.mean(to_avg))
-            overall_results["overall_effectiveness"] = overall_score
+            
             print(f"Overall effectiveness score: {overall_score:.3f}", flush=True)
-            # ────────────────────────────────────────────────────────────
+            # ---------------------------------------------------------------------------
+            
+            # -------------------------- print to ordered json dict ----------------------
+
+            overall_results["overall_effectiveness"]            = overall_score
+            overall_results["true_false_accuracy"]              = tf_acc
+            overall_results["multiple_choice_accuracy"]         = mc_acc
+            overall_results["list_macro_f1_score"]              = list_f1
+
+            overall_results["total_invalid_close_ended"]       = tf_invalid + mc_invalid + list_invalid
+            overall_results["true_false_invalid_count"]        = tf_invalid
+            overall_results["multiple_choice_invalid_count"]   = mc_invalid
+            overall_results["list_invalid_count"]              = list_invalid
+            overall_results["short_semantic_match_score"]      = short_ss
+            overall_results["short_inverse_semantic_match_score"] = short_inv_ss
+            overall_results["multi_hop_semantic_match_score"]   = hop_ss
+            overall_results["multi_hop_inverse_semantic_match_score"] = hop_inv_ss
+
+            overall_results["multiple_choice_match_metrics"]    = mc_match_metrics
+            overall_results["list_match_metrics"]               = list_match_metrics
+            overall_results["multi_hop_inverse_step_identification_rate"] = step_id_score
+
+            overall_results["multiple_choice_average"] = mc_results.get("multiple_choice_average", 0.0)
+            overall_results["multiple_choice_full_match_average"] = mc_results.get("multiple_choice_full_match_average", 0.0)
+            overall_results["multiple_choice_combined_match_average"] = mc_results.get("multiple_choice_combined_match_average", 0.0)
+            overall_results["multiple_choice_full_match"] = mc_results.get("multiple_choice_full_match", 0.0)
+            overall_results["multiple_choice_letter_match"] = mc_results.get("multiple_choice_letter_match", 0.0)
+            overall_results["multiple_choice_mixed_match"] = mc_results.get("multiple_choice_mixed_match", 0.0)
+
+            overall_results["list_overall_macro_avg_precision"] = list_results.get("list_overall_macro_avg_precision", 0.0)
+            overall_results["list_overall_macro_avg_recall"] = list_results.get("list_overall_macro_avg_recall", 0.0)
+            overall_results["list_overall_macro_avg_f1_score"] = list_results.get("list_overall_macro_avg_f1_score", 0.0)
+            overall_results["list_overall_micro_precision"] = list_results.get("list_overall_micro_precision", 0.0)
+            overall_results["list_overall_micro_recall"] = list_results.get("list_overall_micro_recall", 0.0)
+            overall_results["list_overall_micro_f1_score"] = list_results.get("list_overall_micro_f1_score", 0.0)
+            overall_results["list_full_match_macro_precision"] = list_results.get("list_full_match_macro_precision", 0.0)
+            overall_results["list_full_match_macro_recall"] = list_results.get("list_full_match_macro_recall", 0.0)
+            overall_results["list_full_match_macro_f1_score"] = list_results.get("list_full_match_macro_f1_score", 0.0)
+            overall_results["list_full_match_micro_precision"] = list_results.get("list_full_match_micro_precision", 0.0)
+            overall_results["list_full_match_micro_recall"] = list_results.get("list_full_match_micro_recall", 0.0)
+            overall_results["list_full_match_micro_f1_score"] = list_results.get("list_full_match_micro_f1_score", 0.0)
+            overall_results["list_combined_match_macro_precision"] = list_results.get("list_combined_match_macro_precision", 0.0)
+            overall_results["list_combined_match_macro_recall"] = list_results.get("list_combined_match_macro_recall", 0.0)
+            overall_results["list_combined_match_macro_f1_score"] = list_results.get("list_combined_match_macro_f1_score", 0.0)
+            overall_results["list_combined_match_micro_precision"] = list_results.get("list_combined_match_micro_precision", 0.0)
+            overall_results["list_combined_match_micro_recall"] = list_results.get("list_combined_match_micro_recall", 0.0)
+            overall_results["list_combined_match_micro_f1_score"] = list_results.get("list_combined_match_micro_f1_score", 0.0)
+            overall_results["list_full_match"] = list_results.get("list_full_match", 0.0)
+            overall_results["list_letter_match"] = list_results.get("list_letter_match", 0.0)
+            overall_results["list_mixed_match"] = list_results.get("list_mixed_match", 0.0)
+
+            overall_results["open_ended_metrics_per_type"]      = open_ended_metrics
+            overall_results["open_ended_metrics_overall"]       = overall_open
+
+            # Include match-type accuracy for MC and List
+            # overall_results["multiple_choice_match_metrics"] = {
+            #     "full_match": mc_results.get("multiple_choice_full_match", 0.0),
+            #     "letter_match": mc_results.get("multiple_choice_letter_match", 0.0),
+            #     "mixed_match": mc_results.get("multiple_choice_mixed_match", 0.0),
+            # }
+
+            # overall_results["list_match_metrics"] = {
+            #     "full_match": list_results.get("list_full_match", 0.0),
+            #     "letter_match": list_results.get("list_letter_match", 0.0),
+            #     "mixed_match": list_results.get("list_mixed_match", 0.0),
+            # }
+
+            # overall_results["multi_hop_inverse_step_identification_rate"] = \
+            #     multi_hop_inverse_results.get("step_identification_rate", 0.0)
+
+             # Merge everything for overall results
+            overall_results["true_false"]        = tf_results
+            overall_results["multiple_choice"]   = mc_results
+            overall_results["list"]              = list_results
+            overall_results["short"]             = short_results
+            overall_results["short_inverse"]     = short_inverse_results
+            overall_results["multi_hop"]         = multi_hop_results
+            overall_results["multi_hop_inverse"] = multi_hop_inverse_results
 
             # descriptive stats
             for k, vals in open_ended_scores.items():
@@ -1657,10 +2643,16 @@ def parse_args():
         help="bin width for semantic‑similarity histograms (default: 0.05)"
     )
 
+    parser.add_argument(
+        "--output_dir",
+        default="evaluation_output",
+        help="Where to save evaluation results and plots (default: evaluation_output/)"
+    )
+
 
     return parser.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
-    evaluator = ClinIQLinkSampleDatasetEvaluate(run_mode=args.mode, results_dir=args.results_dir, bin_width=args.bin_width)
+    evaluator = ClinIQLinkSampleDatasetEvaluate(run_mode=args.mode, results_dir=args.results_dir, bin_width=args.bin_width, output_dir=args.output_dir)
     evaluator.run_all_evaluations()
